@@ -226,6 +226,8 @@ class FSDPEngineConfig(EngineConfig):
         wrap_policy (Dict[str, Any]): Configuration for FSDP wrap policy.
         param_offload (bool): Whether to offload parameters to CPU, default False
         optimizer_offload (bool): Whether to offload optimizer states to CPU, default False
+        forward_only_cpu_offload (bool): Whether forward-only models use FSDP-managed CPU parameter offload.
+            Defaults to True to preserve the historical reference-policy behavior.
         offload_policy (bool): Whether to offload policy model parameters, default False
         reshard_after_forward (bool): Whether to reshard parameters after forward pass, default True
         fsdp_size (int): FSDP group size. -1 means use all available GPUs.
@@ -242,10 +244,15 @@ class FSDPEngineConfig(EngineConfig):
     """
 
     # ulysses_sequence_parallel_size is mutable for backward compatibility
-    _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
+    _mutable_fields = EngineConfig._mutable_fields | {
+        "forward_only_cpu_offload",
+        "ulysses_sequence_parallel_size",
+    }
 
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)
+    # Preserve the historical ref-policy behavior unless a caller explicitly opts out.
+    forward_only_cpu_offload: bool = True
     offload_policy: bool = False
     reshard_after_forward: bool = True
     fsdp_size: int = -1

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import json
 import logging
 import os
 from contextlib import nullcontext
@@ -31,6 +32,7 @@ from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
 from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.utils import tensordict_utils as tu
 from verl.utils.config import omega_conf_to_dataclass
@@ -43,6 +45,7 @@ from verl.utils.metric import AggregationType
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
+from verl.utils.seqlen_balancing import ceildiv
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
 from verl.workers.config import (
@@ -53,7 +56,14 @@ from verl.workers.config import (
     RolloutConfig,
     TrainingWorkerConfig,
 )
+from verl.workers.engine.utils import (
+    build_synchronized_balanced_micro_batch_indices,
+    compute_masked_loss_stats,
+    raise_if_any_rank_has_errors,
+    reduce_distributed_int,
+)
 from verl.workers.rollout.base import BaseRollout, get_rollout_class
+from verl.workers.rollout.utils import get_max_position_embeddings
 from verl.workers.utils.losses import ppo_loss
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
@@ -469,6 +479,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             teacher_update_cfg = teacher_cfg.get("update", {})
             teacher_privileged_input_cfg = teacher_cfg.get("privileged_input", {})
             loss_cfg = self.opsd_config.get("loss", {})
+            legacy_loss_keys = [key for key in ("loss_mode", "topk_strategy") if key in loss_cfg]
+            if legacy_loss_keys:
+                raise ValueError(
+                    "Deprecated OPSD loss config keys are not accepted because they can silently select the wrong "
+                    f"vocabulary path: {legacy_loss_keys}. Use only opsd.loss.vocab_strategy."
+                )
 
             self.opsd_teacher_model_path = teacher_cfg.get("model_path")
             self.opsd_teacher_share_actor_worker = teacher_cfg.get("share_actor_worker", True)
@@ -488,18 +504,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.opsd_teacher_update_ema_decay = teacher_update_cfg.get("ema_decay", 0.999)
             self.opsd_teacher_privileged_input_mode = teacher_privileged_input_cfg.get("mode", "answer")
 
-            self.opsd_loss_mode = loss_cfg.get("loss_mode", "full_vocab_kl")
             self.opsd_kl_mode = loss_cfg.get("kl_mode", "reverse_kl")
             self.opsd_rl_coupling = loss_cfg.get("rl_coupling", "none")
-            self.opsd_topk_strategy = loss_cfg.get("topk_strategy", "full")
+            self.opsd_vocab_strategy = loss_cfg.get("vocab_strategy", "full")
             self.opsd_student_topk = loss_cfg.get("student_topk", 8)
+            self.opsd_chunked_topk_chunk_size = loss_cfg.get("chunked_topk_chunk_size", 4096)
             self.opsd_teacher_topk = loss_cfg.get("teacher_topk", 8)
-            self.opsd_use_tail = loss_cfg.get("use_tail", self.opsd_topk_strategy != "full")
+            self.opsd_use_tail = loss_cfg.get(
+                "use_tail", self.opsd_vocab_strategy.startswith(("union_", "teacher_"))
+            )
             self.opsd_loss_coef = loss_cfg.get("loss_coef", 1.0)
             self.opsd_temperature = loss_cfg.get("temperature", 1.0)
 
             if self.opsd_teacher_model_path is None:
                 raise ValueError("OPSD requires +opsd.teacher.model_path.")
+            if self.config.actor.strategy not in {"fsdp", "fsdp2"}:
+                raise NotImplementedError(
+                    "OPSD currently supports only the FSDP actor engine, "
+                    f"got actor.strategy={self.config.actor.strategy!r}."
+                )
+            actor_fsdp_cfg = self.config.actor.get("fsdp_config", {})
+            actor_sp_size = max(
+                int(self.config.actor.get("ulysses_sequence_parallel_size", 1)),
+                int(actor_fsdp_cfg.get("ulysses_sequence_parallel_size", 1)),
+            )
+            if actor_sp_size != 1:
+                raise NotImplementedError(
+                    "OPSD teacher full-vocab forward currently requires ulysses_sequence_parallel_size=1."
+                )
             if not self.opsd_teacher_share_actor_worker:
                 raise NotImplementedError(
                     "OPSD currently only supports +opsd.teacher.share_actor_worker=True."
@@ -509,6 +541,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 raise ValueError(
                     f"Invalid OPSD teacher update mode: {self.opsd_teacher_update_mode}. "
                     f"Expected one of {sorted(valid_teacher_update_modes)}."
+                )
+            if self.opsd_teacher_update_mode != "none":
+                raise NotImplementedError(
+                    f"OPSD teacher update mode '{self.opsd_teacher_update_mode}' is reserved but not implemented yet."
                 )
             if self.opsd_teacher_update_interval <= 0:
                 raise ValueError("OPSD teacher.update.interval must be greater than 0.")
@@ -520,17 +556,38 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     f"Invalid OPSD teacher privileged input mode: {self.opsd_teacher_privileged_input_mode}. "
                     f"Expected one of {sorted(valid_teacher_privileged_input_modes)}."
                 )
+            if self.opsd_teacher_privileged_input_mode != "answer":
+                raise NotImplementedError(
+                    "OPSD teacher privileged input mode "
+                    f"'{self.opsd_teacher_privileged_input_mode}' is reserved but not implemented yet."
+                )
             valid_rl_couplings = {"none", "grpo"}
             if self.opsd_rl_coupling not in valid_rl_couplings:
                 raise ValueError(
                     f"Invalid OPSD rl_coupling: {self.opsd_rl_coupling}. "
                     f"Expected one of {sorted(valid_rl_couplings)}."
                 )
-            valid_topk_strategies = {"full", "union", "teacher", "student"}
-            if self.opsd_topk_strategy not in valid_topk_strategies:
+            if self.opsd_rl_coupling != "none":
+                raise NotImplementedError(
+                    f"OPSD rl_coupling '{self.opsd_rl_coupling}' is reserved but not implemented yet."
+                )
+            valid_vocab_strategies = {
+                "full",
+                "student_renorm",
+                "student_truncated",
+                "teacher_renorm",
+                "teacher_truncated",
+                "union_renorm",
+                "union_truncated",
+            }
+            if self.opsd_vocab_strategy not in valid_vocab_strategies:
                 raise ValueError(
-                    f"Invalid OPSD topk_strategy: {self.opsd_topk_strategy}. "
-                    f"Expected one of {sorted(valid_topk_strategies)}."
+                    f"Invalid OPSD vocab_strategy: {self.opsd_vocab_strategy}. "
+                    f"Expected one of {sorted(valid_vocab_strategies)}."
+                )
+            if self.opsd_vocab_strategy not in {"full", "student_renorm", "student_truncated"}:
+                raise NotImplementedError(
+                    f"OPSD vocab strategy '{self.opsd_vocab_strategy}' is reserved but not implemented yet."
                 )
             valid_kl_modes = {"forward_kl", "reverse_kl", "dynamic_merge"}
             if self.opsd_kl_mode not in valid_kl_modes:
@@ -538,12 +595,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     f"Invalid OPSD kl_mode: {self.opsd_kl_mode}. "
                     f"Expected one of {sorted(valid_kl_modes)}."
                 )
+            if self.opsd_kl_mode != "reverse_kl":
+                raise NotImplementedError(f"OPSD kl_mode '{self.opsd_kl_mode}' is reserved but not implemented yet.")
             if self.opsd_student_topk <= 0:
                 raise ValueError("OPSD loss.student_topk must be greater than 0.")
+            if self.opsd_chunked_topk_chunk_size <= 0:
+                raise ValueError("OPSD loss.chunked_topk_chunk_size must be greater than 0.")
             if self.opsd_teacher_topk <= 0:
                 raise ValueError("OPSD loss.teacher_topk must be greater than 0.")
             if self.opsd_temperature <= 0:
                 raise ValueError("OPSD loss.temperature must be greater than 0.")
+            if self.opsd_use_tail:
+                raise NotImplementedError(
+                    "OPSD loss.use_tail=True is reserved for future teacher/union vocabulary strategies."
+                )
             if self.opsd_teacher_use_dynamic_bsz and self.opsd_teacher_max_token_len_per_gpu is None:
                 raise ValueError(
                     "OPSD teacher.max_token_len_per_gpu must be set when teacher.use_dynamic_bsz=True."
@@ -576,11 +641,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.opsd_teacher_update_ema_decay = 0.999
             self.opsd_teacher_privileged_input_mode = "answer"
 
-            self.opsd_loss_mode = "full_vocab_kl"
             self.opsd_kl_mode = "reverse_kl"
             self.opsd_rl_coupling = "none"
-            self.opsd_topk_strategy = "full"
+            self.opsd_vocab_strategy = "full"
             self.opsd_student_topk = 8
+            self.opsd_chunked_topk_chunk_size = 4096
             self.opsd_teacher_topk = 8
             self.opsd_use_tail = False
             self.opsd_loss_coef = 1.0
@@ -795,6 +860,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             opsd_teacher_training_config.engine_config.use_remove_padding = self.opsd_teacher_use_remove_padding
             opsd_teacher_training_config.engine_config.use_fused_kernels = self.opsd_teacher_use_fused_kernels
             opsd_teacher_training_config.engine_config.forward_only = True
+            opsd_teacher_training_config.engine_config.forward_only_cpu_offload = (
+                True if self.opsd_teacher_param_offload is None else self.opsd_teacher_param_offload
+            )
+            # Forward-only FSDP2 offload is controlled by the dedicated flag above.
+            opsd_teacher_training_config.engine_config.offload_policy = False
 
             if self.opsd_teacher_use_dynamic_bsz:
                 assert opsd_teacher_training_config.engine_config.infer_max_token_len_per_gpu is not None
@@ -803,6 +873,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             self.opsd_teacher = TrainingWorker(config=opsd_teacher_training_config)
             self.opsd_teacher.reset()
+            self._validate_opsd_tokenizer_compatibility()
             self.set_dispatch_collect(mesh_name="opsd_teacher", **self.opsd_teacher.get_dispatch_collect())
 
 
@@ -891,18 +962,191 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         return teacher_data
 
+    def _validate_opsd_tokenizer_compatibility(self):
+        if self.actor is None or self.opsd_teacher is None:
+            raise RuntimeError("OPSD tokenizer validation requires initialized actor and teacher workers.")
+
+        student_tokenizer = self.actor.model_config.tokenizer
+        teacher_tokenizer = self.opsd_teacher.model_config.tokenizer
+        if student_tokenizer is None or teacher_tokenizer is None:
+            raise ValueError("OPSD requires both actor and teacher tokenizers to be loaded.")
+
+        student_vocab = student_tokenizer.get_vocab()
+        teacher_vocab = teacher_tokenizer.get_vocab()
+        mismatches = []
+        for token, student_id in student_vocab.items():
+            teacher_id = teacher_vocab.get(token)
+            if teacher_id != student_id:
+                mismatches.append((token, student_id, teacher_id))
+                if len(mismatches) == 3:
+                    break
+        if len(student_vocab) != len(teacher_vocab) or mismatches:
+            raise ValueError(
+                "OPSD actor and teacher must use the same token-to-id vocabulary mapping. "
+                f"Got actor_vocab_size={len(student_vocab)}, teacher_vocab_size={len(teacher_vocab)}, "
+                f"first_mismatches={mismatches}."
+            )
+
+        special_id_names = ("bos_token_id", "eos_token_id", "pad_token_id", "unk_token_id")
+        special_id_mismatches = {
+            name: (getattr(student_tokenizer, name, None), getattr(teacher_tokenizer, name, None))
+            for name in special_id_names
+            if getattr(student_tokenizer, name, None) != getattr(teacher_tokenizer, name, None)
+        }
+        if special_id_mismatches:
+            raise ValueError(
+                "OPSD actor and teacher special token IDs must match. "
+                f"Got mismatches={special_id_mismatches}."
+            )
+
+    def _build_opsd_joint_micro_batch_plan(self, data: TensorDict) -> list[list[int]]:
+        input_ids = data["input_ids"]
+        if not input_ids.is_nested:
+            raise NotImplementedError("OPSD joint batching requires no-padding nested student input_ids.")
+
+        teacher_attention_mask = data.get("opsd_teacher_attention_mask")
+        if teacher_attention_mask is None or teacher_attention_mask.is_nested:
+            raise ValueError("OPSD joint batching requires padded opsd_teacher_attention_mask.")
+
+        student_lengths = input_ids.offsets().diff().to(torch.long).cpu().tolist()
+        teacher_lengths = teacher_attention_mask.sum(dim=-1).to(torch.long).cpu().tolist()
+        batch_size = len(student_lengths)
+
+        dp_group = self.actor.engine.get_data_parallel_group()
+        collective_device = get_device_name()
+
+        validation_errors = []
+        if batch_size == 0 or len(teacher_lengths) != batch_size:
+            validation_errors.append(
+                "OPSD student and teacher batches must be non-empty and row-aligned, "
+                f"got student={batch_size}, teacher={len(teacher_lengths)}."
+            )
+        nonpositive_students = [(index, length) for index, length in enumerate(student_lengths) if length <= 0]
+        nonpositive_teachers = [(index, length) for index, length in enumerate(teacher_lengths) if length <= 0]
+        if nonpositive_students or nonpositive_teachers:
+            validation_errors.append(
+                "OPSD student and teacher sequence lengths must be positive. "
+                f"student={nonpositive_students[:8]}, teacher={nonpositive_teachers[:8]}."
+            )
+
+        response_mask = data.get("response_mask")
+        if response_mask is None:
+            local_response_tokens = 0
+            validation_errors.append("OPSD joint batching requires response_mask.")
+        else:
+            local_response_tokens = int(response_mask.sum().item())
+        global_response_tokens = reduce_distributed_int(
+            local_response_tokens,
+            op=torch.distributed.ReduceOp.SUM,
+            dp_group=dp_group,
+            collective_device=collective_device,
+        )
+        if global_response_tokens == 0:
+            validation_errors.append("OPSD rollout batch must contain at least one response token selected for loss.")
+
+        teacher_max_context = get_max_position_embeddings(self.opsd_teacher.model_config.hf_config)
+        context_violations = [
+            (index, length) for index, length in enumerate(teacher_lengths) if length > teacher_max_context
+        ]
+        if context_violations:
+            validation_errors.append(
+                "OPSD teacher input exceeds the model context window. "
+                f"max_position_embeddings={teacher_max_context}, offending_samples={context_violations[:8]}."
+            )
+
+        actor_engine_config = self.actor.engine_config
+        student_token_budget = None
+        student_micro_batch_size = None
+        if actor_engine_config.use_dynamic_bsz:
+            student_token_budget = actor_engine_config.max_token_len_per_gpu
+            if student_token_budget is None:
+                raise ValueError("OPSD joint batching requires the actor token budget when dynamic batching is on.")
+            student_token_budget = int(student_token_budget)
+        else:
+            student_micro_batch_size = actor_engine_config.micro_batch_size_per_gpu
+            if student_micro_batch_size is None:
+                raise ValueError(
+                    "OPSD joint batching requires the actor micro-batch size when dynamic batching is off."
+                )
+            student_micro_batch_size = int(student_micro_batch_size)
+
+        teacher_token_budget = None
+        teacher_micro_batch_size = None
+        if self.opsd_teacher_use_dynamic_bsz:
+            teacher_token_budget = int(self.opsd_teacher_max_token_len_per_gpu)
+        else:
+            teacher_micro_batch_size = int(self.opsd_teacher_micro_batch_size_per_gpu)
+
+        if student_token_budget is not None:
+            oversized_students = [
+                (index, length) for index, length in enumerate(student_lengths) if length > student_token_budget
+            ]
+            if oversized_students:
+                validation_errors.append(
+                    "An OPSD student sequence exceeds actor.ppo_max_token_len_per_gpu. "
+                    f"budget={student_token_budget}, offending_samples={oversized_students[:8]}."
+                )
+        if teacher_token_budget is not None:
+            oversized_teachers = [
+                (index, length) for index, length in enumerate(teacher_lengths) if length > teacher_token_budget
+            ]
+            if oversized_teachers:
+                validation_errors.append(
+                    "An OPSD teacher sequence exceeds teacher.max_token_len_per_gpu and cannot be fixed by "
+                    f"batch regrouping. budget={teacher_token_budget}, offending_samples={oversized_teachers[:8]}."
+                )
+
+        raise_if_any_rank_has_errors(
+            validation_errors,
+            dp_group=dp_group,
+            collective_device=collective_device,
+            error_prefix="Invalid OPSD joint micro-batch inputs across actor DP ranks",
+        )
+
+        required_group_counts = [1]
+        if student_token_budget is not None:
+            required_group_counts.append(ceildiv(sum(student_lengths), student_token_budget))
+        else:
+            required_group_counts.append(ceildiv(batch_size, student_micro_batch_size))
+        if teacher_token_budget is not None:
+            required_group_counts.append(ceildiv(sum(teacher_lengths), teacher_token_budget))
+        else:
+            required_group_counts.append(ceildiv(batch_size, teacher_micro_batch_size))
+        local_group_count = max(required_group_counts)
+
+        fixed_batch_limits = [
+            limit for limit in (student_micro_batch_size, teacher_micro_batch_size) if limit is not None
+        ]
+        max_micro_batch_size = min(fixed_batch_limits) if fixed_batch_limits else None
+        return build_synchronized_balanced_micro_batch_indices(
+            primary_lengths=teacher_lengths,
+            secondary_lengths=student_lengths,
+            local_num_micro_batches=local_group_count,
+            primary_token_budget=teacher_token_budget,
+            secondary_token_budget=student_token_budget,
+            max_micro_batch_size=max_micro_batch_size,
+            dp_group=dp_group,
+            collective_device=collective_device,
+        )
+
     def _opsd_response_prediction_ranges(self, data: TensorDict) -> list[tuple[int, int]]:
         input_ids = data["input_ids"]
         if not input_ids.is_nested:
             raise NotImplementedError("OPSD full-vocab forward currently expects no-padding nested input_ids.")
 
-        response_mask = data["response_mask"]
-        if response_mask.is_nested:
-            response_lens = response_mask.offsets().diff().to(torch.long)
-        else:
-            response_lens = response_mask.sum(dim=-1).to(torch.long)
-
         seq_lens = input_ids.offsets().diff().to(torch.long)
+        attention_mask = data["attention_mask"]
+        responses = data["responses"]
+        if attention_mask.is_nested or responses.is_nested:
+            raise NotImplementedError("OPSD response alignment currently expects padded attention/response tensors.")
+        response_lens = attention_mask[:, -responses.shape[1] :].sum(dim=-1).to(torch.long)
+        attention_seq_lens = attention_mask.sum(dim=-1).to(torch.long)
+        if not torch.equal(seq_lens.cpu(), attention_seq_lens.cpu()):
+            raise ValueError(
+                "OPSD no-padding sequence lengths must match attention_mask lengths. "
+                f"Got nested={seq_lens.tolist()}, attention={attention_seq_lens.tolist()}."
+            )
+
         seq_offsets = input_ids.offsets()[1:].to(torch.long)
         ranges = []
         for seq_len, resp_len, seq_offset in zip(seq_lens, response_lens, seq_offsets, strict=True):
@@ -923,15 +1167,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     ) -> torch.Tensor:
         assert self.opsd_teacher is not None, "OPSD teacher is not initialized."
         if data_format != "thd":
-            raise NotImplementedError(f"OPSD teacher full-vocab forward only supports data_format='thd', got {data_format!r}.")
+            raise NotImplementedError(
+                f"OPSD teacher full-vocab forward only supports data_format='thd', got {data_format!r}."
+            )
 
         teacher_engine = self.opsd_teacher.engine
         if getattr(teacher_engine, "use_ulysses_sp", False):
             raise NotImplementedError("OPSD teacher full-vocab forward does not support Ulysses SP yet.")
         if not self.opsd_teacher_use_remove_padding:
-            raise NotImplementedError("OPSD teacher full-vocab forward currently requires teacher.use_remove_padding=True.")
+            raise NotImplementedError(
+                "OPSD teacher full-vocab forward currently requires teacher.use_remove_padding=True."
+            )
         if self.opsd_teacher_use_fused_kernels:
-            raise NotImplementedError("OPSD teacher full-vocab forward requires materialized logits, not fused kernels.")
+            raise NotImplementedError(
+                "OPSD teacher full-vocab forward requires materialized logits, not fused kernels."
+            )
 
         has_leading_dim = student_logits.dim() == 3 and student_logits.shape[0] == 1
         student_logits_values = student_logits.squeeze(0) if has_leading_dim else student_logits
@@ -944,16 +1194,40 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         teacher_data = self._build_opsd_teacher_forward_batch(data)
         teacher_data = left_right_2_no_padding(teacher_data)
-        teacher_ranges = self._opsd_response_prediction_ranges(teacher_data)
         tu.assign_non_tensor(
             teacher_data,
             temperature=tu.get_non_tensor_data(data=data, key="temperature", default=self.opsd_temperature),
             use_remove_padding=True,
+            use_dynamic_bsz=self.opsd_teacher_use_dynamic_bsz,
+            max_token_len_per_gpu=self.opsd_teacher_max_token_len_per_gpu,
+            micro_batch_size_per_gpu=self.opsd_teacher_micro_batch_size_per_gpu,
             use_fused_kernels=False,
         )
-        teacher_data = teacher_data.to(get_device_id())
 
+        teacher_group_lengths = teacher_data["input_ids"].offsets().diff().to(torch.long)
+        teacher_group_tokens = int(teacher_group_lengths.sum().item())
+        if self.opsd_teacher_use_dynamic_bsz:
+            if teacher_group_tokens > self.opsd_teacher_max_token_len_per_gpu:
+                raise RuntimeError(
+                    "OPSD joint batching produced a teacher group over its token budget: "
+                    f"tokens={teacher_group_tokens}, budget={self.opsd_teacher_max_token_len_per_gpu}."
+                )
+        elif len(teacher_data) > self.opsd_teacher_micro_batch_size_per_gpu:
+            raise RuntimeError(
+                "OPSD joint batching produced a teacher group over its fixed micro-batch size: "
+                f"size={len(teacher_data)}, limit={self.opsd_teacher_micro_batch_size_per_gpu}."
+            )
+        tu.assign_non_tensor(
+            data,
+            opsd_teacher_micro_batch_count=1,
+            opsd_teacher_group_tokens=teacher_group_tokens,
+            opsd_teacher_group_max_sequence_len=int(teacher_group_lengths.max().item()),
+        )
+
+        teacher_logits_aligned = torch.zeros_like(student_logits_values)
+        teacher_data = teacher_data.to(get_device_id())
         with teacher_engine.eval_mode(), torch.no_grad():
+            teacher_ranges = self._opsd_response_prediction_ranges(teacher_data)
             model_inputs, output_args = teacher_engine.prepare_model_inputs(micro_batch=teacher_data)
             autocast_dtype = getattr(teacher_engine, "_autocast_dtype", torch.bfloat16)
             autocast_ctx = (
@@ -964,30 +1238,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             with autocast_ctx:
                 raw_output = teacher_engine.module(**model_inputs, use_cache=False)
 
-        teacher_logits_values = raw_output.logits.squeeze(0)
-        if teacher_logits_values.shape[0] != teacher_data["input_ids"].values().shape[0]:
-            raise NotImplementedError(
-                "OPSD teacher full-vocab alignment currently requires unsliced teacher logits. "
-                "Sequence-parallel teacher logits are not supported yet."
+            teacher_logits_values = raw_output.logits.squeeze(0)
+            if teacher_logits_values.shape[0] != teacher_data["input_ids"].values().shape[0]:
+                raise NotImplementedError(
+                    "OPSD teacher full-vocab alignment currently requires unsliced teacher logits. "
+                    "Sequence-parallel teacher logits are not supported yet."
+                )
+            temperature_rmpad = output_args["temperature_rmpad"]
+            teacher_logits_values = teacher_logits_values / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(
+                teacher_logits_values.dtype
             )
-        temperature_rmpad = output_args["temperature_rmpad"]
-        teacher_logits_values = teacher_logits_values / temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(
-            teacher_logits_values.dtype
-        )
 
-        teacher_logits_aligned = torch.zeros_like(student_logits_values)
-        for student_range, teacher_range in zip(student_ranges, teacher_ranges, strict=True):
-            student_start, student_end = student_range
-            teacher_start, teacher_end = teacher_range
-            if student_end - student_start != teacher_end - teacher_start:
-                raise ValueError(
-                    "OPSD teacher/student response lengths must match after privileged input construction. "
-                    f"Got student={student_end - student_start}, teacher={teacher_end - teacher_start}."
-                )
-            if student_end > student_start:
-                teacher_logits_aligned[student_start:student_end] = teacher_logits_values[teacher_start:teacher_end].to(
-                    teacher_logits_aligned.dtype
-                )
+            for student_range, teacher_range in zip(student_ranges, teacher_ranges, strict=True):
+                student_start, student_end = student_range
+                teacher_start, teacher_end = teacher_range
+                if student_end - student_start != teacher_end - teacher_start:
+                    raise ValueError(
+                        "OPSD teacher/student response lengths must match after privileged input construction. "
+                        f"Got student={student_end - student_start}, teacher={teacher_end - teacher_start}."
+                    )
+                if student_end > student_start:
+                    teacher_logits_aligned[student_start:student_end] = teacher_logits_values[
+                        teacher_start:teacher_end
+                    ].to(teacher_logits_aligned.dtype)
 
         return teacher_logits_aligned.unsqueeze(0) if has_leading_dim else teacher_logits_aligned
 
@@ -1000,13 +1273,61 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     def _select_opsd_vocab_for_loss(
         self, student_logits: torch.Tensor, teacher_logits: torch.Tensor, data: TensorDict
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        strategy = tu.get_non_tensor_data(data=data, key="opsd_topk_strategy", default=self.opsd_topk_strategy)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._validate_opsd_logits(student_logits=student_logits, teacher_logits=teacher_logits)
+        strategy = tu.get_non_tensor_data(data=data, key="opsd_vocab_strategy", default=self.opsd_vocab_strategy)
+
         if strategy == "full":
-            return student_logits, teacher_logits
-        if strategy in {"union", "teacher", "student"}:
-            raise NotImplementedError(f"OPSD top-k strategy '{strategy}' is reserved but not implemented yet.")
-        raise ValueError(f"Invalid OPSD top-k strategy: {strategy}.")
+            student_log_probs = torch.log_softmax(student_logits.float(), dim=-1)
+            teacher_log_probs = torch.log_softmax(teacher_logits.detach().float(), dim=-1)
+            return student_log_probs.exp(), student_log_probs, teacher_log_probs
+
+        if strategy in {"student_renorm", "student_truncated"}:
+            topk = int(tu.get_non_tensor_data(data=data, key="opsd_student_topk", default=self.opsd_student_topk))
+            vocab_size = student_logits.shape[-1]
+            if topk <= 0:
+                raise ValueError(f"OPSD student_topk must be greater than 0, got {topk}.")
+            if topk > vocab_size:
+                raise ValueError(f"OPSD student_topk ({topk}) cannot exceed vocab size ({vocab_size}).")
+            use_tail = bool(tu.get_non_tensor_data(data=data, key="opsd_use_tail", default=self.opsd_use_tail))
+            if use_tail:
+                raise NotImplementedError(f"OPSD top-k strategy '{strategy}' currently requires use_tail=False.")
+
+            if strategy == "student_renorm":
+                student_topk_logits, student_topk_ids = torch.topk(
+                    student_logits, k=topk, dim=-1, sorted=True
+                )
+                teacher_topk_logits = torch.gather(teacher_logits.detach(), dim=-1, index=student_topk_ids)
+                student_log_probs = torch.log_softmax(student_topk_logits.float(), dim=-1)
+                teacher_log_probs = torch.log_softmax(teacher_topk_logits.float(), dim=-1)
+                return student_log_probs.exp(), student_log_probs, teacher_log_probs
+
+            # softmax preserves logit ordering, so selecting IDs from logits is
+            # equivalent to selecting them from the full-vocabulary probabilities.
+            student_topk_ids = torch.topk(student_logits.detach(), k=topk, dim=-1, sorted=True).indices
+            chunk_size = int(
+                tu.get_non_tensor_data(
+                    data=data,
+                    key="opsd_chunked_topk_chunk_size",
+                    default=self.opsd_chunked_topk_chunk_size,
+                )
+            )
+            student_topk_log_probs = _chunked_topk_log_probs(
+                logits=student_logits,
+                topk_ids=student_topk_ids,
+                chunk_size=chunk_size,
+            ).float()
+            teacher_topk_log_probs = _chunked_topk_log_probs(
+                logits=teacher_logits.detach(),
+                topk_ids=student_topk_ids,
+                chunk_size=chunk_size,
+            ).float()
+            student_topk_probs = student_topk_log_probs.exp()
+            return student_topk_probs, student_topk_log_probs, teacher_topk_log_probs
+
+        if strategy in {"teacher_renorm", "teacher_truncated", "union_renorm", "union_truncated"}:
+            raise NotImplementedError(f"OPSD vocab strategy '{strategy}' is reserved but not implemented yet.")
+        raise ValueError(f"Invalid OPSD vocab strategy: {strategy}.")
 
     def _validate_opsd_logits(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor):
         if student_logits.shape != teacher_logits.shape:
@@ -1019,46 +1340,266 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if student_logits.shape[-1] <= 0:
             raise ValueError("OPSD logits must have a non-empty vocab dimension.")
 
-    def _compute_opsd_reverse_kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
-        teacher_logits = teacher_logits.detach()
-        student_log_probs = torch.log_softmax(student_logits.float(), dim=-1)
-        teacher_log_probs = torch.log_softmax(teacher_logits.float(), dim=-1)
-        student_probs = student_log_probs.exp()
+    def _validate_opsd_distributions(
+        self,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+    ):
+        if student_probs.shape != student_log_probs.shape or student_probs.shape != teacher_log_probs.shape:
+            raise ValueError(
+                "OPSD student/teacher distributions must have the same shape, "
+                f"got student_probs={tuple(student_probs.shape)}, "
+                f"student_log_probs={tuple(student_log_probs.shape)}, "
+                f"teacher_log_probs={tuple(teacher_log_probs.shape)}."
+            )
+        if student_probs.dim() < 2:
+            raise ValueError(
+                f"OPSD distributions must include a vocab dimension, got shape={tuple(student_probs.shape)}."
+            )
+        if student_probs.shape[-1] <= 0:
+            raise ValueError("OPSD distributions must have a non-empty vocab dimension.")
+
+    def _compute_opsd_reverse_kl(
+        self,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+    ) -> torch.Tensor:
         return (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
 
-    def _compute_opsd_forward_kl(self, student_logits: torch.Tensor, teacher_logits: torch.Tensor) -> torch.Tensor:
+    def _compute_opsd_forward_kl(
+        self,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+    ) -> torch.Tensor:
         raise NotImplementedError("OPSD forward_kl is reserved but not implemented yet.")
 
     def _compute_opsd_dynamic_merge_kl(
-        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor, data: TensorDict
+        self,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        data: TensorDict,
     ) -> torch.Tensor:
         raise NotImplementedError("OPSD dynamic_merge KL is reserved but not implemented yet.")
 
     def _compute_opsd_kl_by_mode(
-        self, kl_mode: str, student_logits: torch.Tensor, teacher_logits: torch.Tensor, data: TensorDict
+        self,
+        kl_mode: str,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        data: TensorDict,
     ) -> torch.Tensor:
         if kl_mode == "reverse_kl":
-            return self._compute_opsd_reverse_kl(student_logits=student_logits, teacher_logits=teacher_logits)
+            return self._compute_opsd_reverse_kl(
+                student_probs=student_probs,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+            )
         if kl_mode == "forward_kl":
-            return self._compute_opsd_forward_kl(student_logits=student_logits, teacher_logits=teacher_logits)
+            return self._compute_opsd_forward_kl(
+                student_probs=student_probs,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+            )
         if kl_mode == "dynamic_merge":
             return self._compute_opsd_dynamic_merge_kl(
-                student_logits=student_logits, teacher_logits=teacher_logits, data=data
+                student_probs=student_probs,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                data=data,
             )
         raise ValueError(f"Invalid OPSD kl_mode: {kl_mode}.")
 
     def _compute_opsd_token_loss(
-        self, student_logits: torch.Tensor, teacher_logits: torch.Tensor, data: TensorDict
+        self,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        data: TensorDict,
     ) -> torch.Tensor:
-        self._validate_opsd_logits(student_logits=student_logits, teacher_logits=teacher_logits)
-        loss_mode = tu.get_non_tensor_data(data=data, key="opsd_loss_mode", default=self.opsd_loss_mode)
-        if loss_mode != "full_vocab_kl":
-            raise NotImplementedError(f"OPSD loss_mode={loss_mode!r} is reserved but not implemented yet.")
-
+        self._validate_opsd_distributions(
+            student_probs=student_probs,
+            student_log_probs=student_log_probs,
+            teacher_log_probs=teacher_log_probs,
+        )
         kl_mode = tu.get_non_tensor_data(data=data, key="opsd_kl_mode", default=self.opsd_kl_mode)
         return self._compute_opsd_kl_by_mode(
-            kl_mode=kl_mode, student_logits=student_logits, teacher_logits=teacher_logits, data=data
+            kl_mode=kl_mode,
+            student_probs=student_probs,
+            student_log_probs=student_log_probs,
+            teacher_log_probs=teacher_log_probs,
+            data=data,
         )
+
+    def _opsd_test_token_text(self, token_id: int) -> str:
+        tokenizer = self.actor.model_config.tokenizer
+        try:
+            return str(tokenizer.convert_ids_to_tokens(int(token_id)))
+        except Exception:
+            return tokenizer.decode([int(token_id)], skip_special_tokens=False)
+
+    def _build_opsd_test_records(
+        self,
+        *,
+        data: TensorDict,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        student_probs: torch.Tensor,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        token_losses: torch.Tensor,
+    ) -> list[dict]:
+        """Build bounded, JSON-safe evidence from the tensors used by the real OPSD loss."""
+        if not tu.get_non_tensor_data(data=data, key="opsd_test_enabled", default=False):
+            return []
+
+        student_logits = student_logits.squeeze(0) if student_logits.dim() == 3 else student_logits
+        teacher_logits = teacher_logits.squeeze(0) if teacher_logits.dim() == 3 else teacher_logits
+        student_probs = student_probs.squeeze(0) if student_probs.dim() == 3 else student_probs
+        student_log_probs = student_log_probs.squeeze(0) if student_log_probs.dim() == 3 else student_log_probs
+        teacher_log_probs = teacher_log_probs.squeeze(0) if teacher_log_probs.dim() == 3 else teacher_log_probs
+        token_losses = token_losses.squeeze(0) if token_losses.dim() == 2 else token_losses
+
+        response_ranges = self._opsd_response_prediction_ranges(data)
+        responses = data["responses"]
+        response_mask = data["response_mask"].bool()
+        strategy = tu.get_non_tensor_data(data=data, key="opsd_vocab_strategy", default=self.opsd_vocab_strategy)
+        diagnostic_topk = min(
+            int(tu.get_non_tensor_data(data=data, key="opsd_test_topk", default=5)), student_logits.shape[-1]
+        )
+        max_samples = int(tu.get_non_tensor_data(data=data, key="opsd_test_max_samples", default=2))
+        max_response_tokens = int(
+            tu.get_non_tensor_data(data=data, key="opsd_test_max_response_tokens", default=32)
+        )
+        max_loss_vocab_tokens = int(
+            tu.get_non_tensor_data(data=data, key="opsd_test_max_loss_vocab_tokens", default=32)
+        )
+        loss_coef = float(tu.get_non_tensor_data(data=data, key="opsd_loss_coef", default=self.opsd_loss_coef))
+        global_step = int(tu.get_non_tensor_data(data=data, key="opsd_test_global_step", default=-1))
+
+        uid_values = data.get("uid")
+        records = []
+        for sample_index, (response_start, response_end) in enumerate(response_ranges[:max_samples]):
+            uid = None
+            if uid_values is not None:
+                uid = tu.unwrap_non_tensor_data(uid_values[sample_index])
+            sample_record = {
+                "global_step": global_step,
+                "worker_rank": int(self.rank),
+                "sample_index_on_worker": sample_index,
+                "sample_uid": None if uid is None else str(uid),
+                "vocab_strategy": str(strategy),
+                "kl_mode": str(
+                    tu.get_non_tensor_data(data=data, key="opsd_kl_mode", default=self.opsd_kl_mode)
+                ),
+                "loss_coef": loss_coef,
+                "response_tokens_selected": int(response_mask[sample_index].sum().item()),
+                "tokens": [],
+            }
+
+            recorded_tokens = 0
+            for response_index, prediction_index in enumerate(range(response_start, response_end)):
+                if not bool(response_mask[sample_index, response_index].item()):
+                    continue
+                if recorded_tokens >= max_response_tokens:
+                    break
+
+                student_row = student_logits[prediction_index].float()
+                teacher_row = teacher_logits[prediction_index].float()
+                student_topk_logits, student_topk_ids = torch.topk(student_row, k=diagnostic_topk, sorted=True)
+                teacher_topk_logits, teacher_topk_ids = torch.topk(teacher_row, k=diagnostic_topk, sorted=True)
+                student_topk_log_probs = student_topk_logits - torch.logsumexp(student_row, dim=-1)
+                teacher_topk_log_probs_full = teacher_topk_logits - torch.logsumexp(teacher_row, dim=-1)
+
+                def topk_entries(ids: torch.Tensor, log_probs: torch.Tensor) -> list[dict]:
+                    return [
+                        {
+                            "token_id": int(token_id),
+                            "token": self._opsd_test_token_text(int(token_id)),
+                            "log_prob": float(log_prob),
+                            "prob": float(log_prob.exp()),
+                        }
+                        for token_id, log_prob in zip(
+                            ids.detach().cpu().tolist(), log_probs.detach().cpu(), strict=True
+                        )
+                    ]
+
+                raw_token_loss = float(token_losses[prediction_index].detach().float().cpu())
+                loss_calculation = {
+                    "raw_token_loss": raw_token_loss,
+                    "weighted_token_loss": raw_token_loss * loss_coef,
+                    "vocabulary_mode": "full" if strategy == "full" else "student_topk",
+                    "vocabulary_size": int(student_logits.shape[-1]),
+                    "terms": [],
+                }
+
+                if strategy == "full":
+                    loss_ids = student_topk_ids[:max_loss_vocab_tokens]
+                    full_student_log_probs = student_topk_log_probs[:max_loss_vocab_tokens]
+                    full_teacher_log_probs = (
+                        torch.gather(teacher_row, dim=-1, index=loss_ids) - torch.logsumexp(teacher_row, dim=-1)
+                    )
+                    full_student_probs = full_student_log_probs.exp()
+                    loss_calculation["reported_terms_are_diagnostic_subset"] = True
+                else:
+                    loss_width = student_log_probs.shape[-1]
+                    loss_ids = torch.topk(student_row.detach(), k=loss_width, dim=-1, sorted=True).indices
+                    reported_width = min(loss_width, max_loss_vocab_tokens)
+                    loss_ids = loss_ids[:reported_width]
+                    full_student_probs = student_probs[prediction_index, :reported_width]
+                    full_student_log_probs = student_log_probs[prediction_index, :reported_width]
+                    full_teacher_log_probs = teacher_log_probs[prediction_index, :reported_width]
+                    loss_calculation["selected_vocabulary_size"] = int(loss_width)
+                    loss_calculation["reported_terms_are_diagnostic_subset"] = reported_width < loss_width
+
+                contributions = full_student_probs * (full_student_log_probs - full_teacher_log_probs)
+                for token_id, prob, student_lp, teacher_lp, contribution in zip(
+                    loss_ids.detach().cpu().tolist(),
+                    full_student_probs.detach().float().cpu().tolist(),
+                    full_student_log_probs.detach().float().cpu().tolist(),
+                    full_teacher_log_probs.detach().float().cpu().tolist(),
+                    contributions.detach().float().cpu().tolist(),
+                    strict=True,
+                ):
+                    loss_calculation["terms"].append(
+                        {
+                            "token_id": int(token_id),
+                            "token": self._opsd_test_token_text(int(token_id)),
+                            "student_prob": prob,
+                            "student_log_prob": student_lp,
+                            "teacher_log_prob": teacher_lp,
+                            "reverse_kl_contribution": contribution,
+                        }
+                    )
+                reported_sum = float(contributions.sum().detach().float().cpu())
+                loss_calculation["reported_contribution_sum"] = reported_sum
+                loss_calculation["unreported_contribution"] = raw_token_loss - reported_sum
+
+                rollout_token_id = int(responses[sample_index, response_index].item())
+                sample_record["tokens"].append(
+                    {
+                        "response_index": response_index,
+                        "prediction_index_in_unpadded_batch": prediction_index,
+                        "rollout_token_id": rollout_token_id,
+                        "rollout_token": self._opsd_test_token_text(rollout_token_id),
+                        "included_in_loss": True,
+                        "student_topk": topk_entries(student_topk_ids, student_topk_log_probs),
+                        "teacher_topk": topk_entries(teacher_topk_ids, teacher_topk_log_probs_full),
+                        "loss_calculation": loss_calculation,
+                    }
+                )
+                recorded_tokens += 1
+
+            sample_record["response_tokens_recorded"] = recorded_tokens
+            sample_record["response_tokens_truncated_in_report"] = (
+                sample_record["response_tokens_selected"] > recorded_tokens
+            )
+            records.append(sample_record)
+        return records
 
     def _aggregate_opsd_loss(self, model_output: dict, data: TensorDict, dp_group=None):
         if "opsd_losses" not in model_output:
@@ -1086,14 +1627,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         loss_coef = tu.get_non_tensor_data(data=data, key="opsd_loss_coef", default=self.opsd_loss_coef)
         opsd_loss = opsd_loss * loss_coef
 
-        valid_losses = opsd_losses[response_mask]
+        valid_loss_sum, _, valid_loss_min, valid_loss_max = compute_masked_loss_stats(
+            losses=opsd_losses,
+            loss_mask=response_mask,
+        )
         metrics = {
             "opsd_loss": Metric(value=opsd_loss.detach(), aggregation=AggregationType.SUM),
-            "opsd_token_loss_mean": Metric(value=valid_losses.mean().detach(), aggregation=AggregationType.MEAN),
-            "opsd_token_loss_min": Metric(value=valid_losses.min().detach(), aggregation=AggregationType.MIN),
-            "opsd_token_loss_max": Metric(value=valid_losses.max().detach(), aggregation=AggregationType.MAX),
+            "opsd_token_loss_sum": Metric(value=valid_loss_sum.detach(), aggregation=AggregationType.SUM),
+            "opsd_token_loss_min": Metric(value=valid_loss_min.detach(), aggregation=AggregationType.MIN),
+            "opsd_token_loss_max": Metric(value=valid_loss_max.detach(), aggregation=AggregationType.MAX),
             "opsd_response_tokens": Metric(value=response_mask.sum().detach(), aggregation=AggregationType.SUM),
+            "opsd_teacher_micro_batches": Metric(
+                value=opsd_losses.new_tensor(
+                    tu.get_non_tensor_data(data=data, key="opsd_teacher_micro_batch_count", default=1)
+                ),
+                aggregation=AggregationType.SUM,
+            ),
+            "opsd_teacher_tokens_per_micro_batch": Metric(
+                value=opsd_losses.new_tensor(
+                    tu.get_non_tensor_data(data=data, key="opsd_teacher_group_tokens", default=0)
+                ),
+                aggregation=AggregationType.MEAN,
+            ),
+            "opsd_teacher_tokens_per_micro_batch_max": Metric(
+                value=opsd_losses.new_tensor(
+                    tu.get_non_tensor_data(data=data, key="opsd_teacher_group_tokens", default=0)
+                ),
+                aggregation=AggregationType.MAX,
+            ),
+            "opsd_teacher_max_sequence_len": Metric(
+                value=opsd_losses.new_tensor(
+                    tu.get_non_tensor_data(data=data, key="opsd_teacher_group_max_sequence_len", default=0)
+                ),
+                aggregation=AggregationType.MAX,
+            ),
         }
+        test_records_json = getattr(self, "_opsd_test_pending_records_json", None)
+        if test_records_json is not None:
+            metrics["opsd_test_records_json"] = test_records_json
+            self._opsd_test_pending_records_json = None
         return opsd_loss, metrics
 
     def _opsd_actor_loss(
@@ -1112,13 +1684,29 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             teacher_logits = self._compute_opsd_teacher_full_vocab(
                 data=data, student_logits=student_logits, data_format=data_format
             )
-            student_logits, teacher_logits = self._select_opsd_vocab_for_loss(
+            student_probs, student_log_probs, teacher_log_probs = self._select_opsd_vocab_for_loss(
                 student_logits=student_logits, teacher_logits=teacher_logits, data=data
             )
             opsd_losses = self._compute_opsd_token_loss(
-                student_logits=student_logits, teacher_logits=teacher_logits, data=data
+                student_probs=student_probs,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                data=data,
             )
-            return {"opsd_losses": opsd_losses}
+            output = {"opsd_losses": opsd_losses}
+            test_records = self._build_opsd_test_records(
+                data=data,
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                student_probs=student_probs,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
+                token_losses=opsd_losses,
+            )
+            if test_records:
+                self._opsd_test_pending_records_json = json.dumps(test_records, ensure_ascii=False)
+            del teacher_logits
+            return output
         return self._aggregate_opsd_loss(model_output=model_output, data=data, dp_group=dp_group)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
@@ -1126,6 +1714,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @_with_routing_replay_flag(enabled=True)
     def update_actor_opsd(self, data: TensorDict) -> TensorDict:
         assert self.opsd_enabled, "update_actor_opsd is only valid when OPSD is enabled."
+        dataloader_kwargs = tu.get_non_tensor_data(data=data, key="dataloader_kwargs", default={})
+        if dataloader_kwargs.get("shuffle", False):
+            raise ValueError("OPSD joint micro-batch indices require actor_rollout_ref.actor.shuffle=False.")
+
+        partitions = self._build_opsd_joint_micro_batch_plan(data)
+        self._opsd_test_pending_records_json = None
+        tu.assign_non_tensor_data(data, "precomputed_micro_batch_indices", partitions)
         tu.assign_non_tensor(data, opsd_use_logits_processor=True)
         output = self.actor.train_mini_batch(data=data, loss_function=self._opsd_actor_loss)
         return output.cpu() if output is not None else None

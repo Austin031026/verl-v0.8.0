@@ -361,6 +361,51 @@ class RayPPOTrainer:
             if self.use_opsd
             else "answer"
         )
+        self.opsd_test_config = self.opsd_config.get("test", {}) if self.use_opsd else {}
+        self.opsd_test_enabled = bool(self.opsd_test_config.get("enabled", False))
+        self.opsd_test_steps = {int(step) for step in self.opsd_test_config.get("steps", [])}
+        self.opsd_test_output_path = None
+        self._opsd_test_privileged_input_evidence = None
+        self._opsd_test_report = None
+        if self.opsd_test_enabled:
+            output_path = self.opsd_test_config.get("output_path", "opsd_test_result.json")
+            self.opsd_test_output_path = os.path.abspath(os.path.expanduser(str(output_path)))
+            student_model_path = str(self.config.actor_rollout_ref.model.path)
+            teacher_model_path = str(self.opsd_config.get("teacher", {}).get("model_path", ""))
+            teacher_update_mode = str(self.opsd_config.get("teacher", {}).get("update", {}).get("mode", "none"))
+            self._opsd_test_report = {
+                "schema_version": "1.0",
+                "status": "running",
+                "test_mode": "real_verl_runtime",
+                "output_path": self.opsd_test_output_path,
+                "requested_steps": sorted(self.opsd_test_steps),
+                "opsd_config": OmegaConf.to_container(self.opsd_config, resolve=True),
+                "modules": {
+                    "config": {"status": "pass"},
+                    "model_identity": {
+                        "status": "pass" if student_model_path == teacher_model_path else "fail",
+                        "student_model_path": student_model_path,
+                        "teacher_model_path": teacher_model_path,
+                    },
+                    "teacher_update_mode": {
+                        "status": "pass" if teacher_update_mode == "none" else "fail",
+                        "expected": "none",
+                        "actual": teacher_update_mode,
+                    },
+                    "rollout_lifecycle": {"status": "pending"},
+                    "privileged_input": {"status": "pending"},
+                    "teacher_batch": {"status": "pending"},
+                    "teacher_student_alignment": {"status": "pending"},
+                    "joint_micro_batching": {"status": "pending"},
+                    "vocab_selection": {"status": "pending"},
+                    "kl_loss": {"status": "pending"},
+                    "loss_aggregation": {"status": "pending"},
+                    "optimizer_update": {"status": "pending"},
+                    "memory": {"status": "pending"},
+                },
+                "steps": [],
+            }
+            self._write_opsd_test_report()
 
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
@@ -494,6 +539,173 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _write_opsd_test_report(self):
+        if not self.opsd_test_enabled:
+            return
+        output_dir = os.path.dirname(self.opsd_test_output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        temp_path = f"{self.opsd_test_output_path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(self._opsd_test_report, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(temp_path, self.opsd_test_output_path)
+
+    def record_opsd_test_failure(self, stage: str, error: Exception):
+        if not self.opsd_test_enabled:
+            return
+        self._opsd_test_report["status"] = "fail"
+        self._opsd_test_report["failure"] = {
+            "stage": stage,
+            "error_type": type(error).__name__,
+            "message": str(error),
+            "global_step": getattr(self, "global_steps", None),
+        }
+        self._write_opsd_test_report()
+
+    def _opsd_test_is_enabled_for_step(self) -> bool:
+        return self.opsd_test_enabled and (not self.opsd_test_steps or self.global_steps in self.opsd_test_steps)
+
+    @staticmethod
+    def _decode_opsd_test_records(values) -> list[dict]:
+        records = []
+        if values is None:
+            return records
+        if isinstance(values, str):
+            decoded = json.loads(values)
+            return decoded if isinstance(decoded, list) else [decoded]
+        if isinstance(values, (list, tuple)):
+            for value in values:
+                records.extend(RayPPOTrainer._decode_opsd_test_records(value))
+            return records
+        raise TypeError(f"Unsupported OPSD test record container: {type(values)}")
+
+    def _record_opsd_test_step(self, records: list[dict], actor_metrics: dict, is_last_step: bool):
+        if not self._opsd_test_is_enabled_for_step():
+            return
+
+        max_samples = int(self.opsd_test_config.get("max_samples_per_step", 2))
+        records = records[:max_samples]
+        token_records = [token for sample in records for token in sample.get("tokens", [])]
+        finite_losses = all(
+            np.isfinite(token["loss_calculation"]["raw_token_loss"]) for token in token_records
+        )
+        contribution_matches = all(
+            token["loss_calculation"].get("reported_terms_are_diagnostic_subset", False)
+            or abs(token["loss_calculation"]["unreported_contribution"]) <= 1e-5
+            for token in token_records
+        )
+        privileged_evidence = self._opsd_test_privileged_input_evidence or {}
+        privileged_ok = bool(
+            privileged_evidence.get("student_input_ids_unchanged")
+            and privileged_evidence.get("teacher_response_ids_match_student")
+            and privileged_evidence.get("teacher_response_mask_matches_student")
+        )
+        grad_norm = actor_metrics.get("actor/grad_norm")
+        optimizer_ok = grad_norm is not None and np.isfinite(grad_norm) and grad_norm > 0
+        current_uids = {record.get("sample_uid") for record in records if record.get("sample_uid") is not None}
+        previous_uids = {
+            uid
+            for step in self._opsd_test_report["steps"]
+            for uid in step["modules"]["rollout_lifecycle"].get("rollout_sample_uids", [])
+            if uid is not None
+        }
+        fresh_rollout = bool(current_uids) and current_uids.isdisjoint(previous_uids)
+        token_loss_sum = actor_metrics.get("actor/opsd_token_loss_sum")
+        response_tokens = actor_metrics.get("actor/opsd_response_tokens")
+        token_loss_mean = actor_metrics.get("actor/opsd_token_loss_mean")
+        aggregation_ok = bool(
+            token_loss_sum is not None
+            and response_tokens is not None
+            and response_tokens > 0
+            and token_loss_mean is not None
+            and np.isfinite(token_loss_mean)
+            and abs(token_loss_mean - token_loss_sum / response_tokens) <= 1e-8
+        )
+        memory_allocated = actor_metrics.get("actor/perf/max_memory_allocated_gb")
+        memory_reserved = actor_metrics.get("actor/perf/max_memory_reserved_gb")
+        memory_ok = bool(
+            memory_allocated is not None
+            and memory_reserved is not None
+            and np.isfinite(memory_allocated)
+            and np.isfinite(memory_reserved)
+        )
+
+        step_modules = {
+            "rollout_lifecycle": {
+                "status": "pass" if records and token_records and fresh_rollout else "fail",
+                "fresh_rollout": fresh_rollout,
+                "rollout_sample_uids": sorted(current_uids),
+            },
+            "privileged_input": {
+                "status": "pass" if privileged_ok else "fail",
+                "evidence": privileged_evidence,
+            },
+            "teacher_batch": {
+                "status": "pass" if privileged_ok else "fail",
+                "response_ids_match": privileged_evidence.get("teacher_response_ids_match_student", False),
+                "response_mask_matches": privileged_evidence.get(
+                    "teacher_response_mask_matches_student", False
+                ),
+            },
+            "teacher_student_alignment": {
+                "status": "pass" if records and token_records else "fail",
+                "checked_response_tokens": len(token_records),
+            },
+            "joint_micro_batching": {
+                "status": "pass" if actor_metrics.get("actor/opsd_teacher_micro_batches", 0) > 0 else "fail",
+                "teacher_micro_batches": actor_metrics.get("actor/opsd_teacher_micro_batches"),
+                "teacher_tokens_per_micro_batch_max": actor_metrics.get(
+                    "actor/opsd_teacher_tokens_per_micro_batch_max"
+                ),
+                "teacher_max_sequence_len": actor_metrics.get("actor/opsd_teacher_max_sequence_len"),
+            },
+            "vocab_selection": {
+                "status": "pass" if records and contribution_matches else "fail",
+                "strategy": self.opsd_config.get("loss", {}).get("vocab_strategy", "full"),
+                "reported_contributions_match_token_loss": contribution_matches,
+            },
+            "kl_loss": {
+                "status": "pass" if token_records and finite_losses else "fail",
+                "finite_token_losses": finite_losses,
+                "opsd_loss": actor_metrics.get("actor/opsd_loss"),
+                "opsd_token_loss_mean": actor_metrics.get("actor/opsd_token_loss_mean"),
+            },
+            "loss_aggregation": {
+                "status": "pass" if aggregation_ok else "fail",
+                "token_loss_sum": token_loss_sum,
+                "response_tokens": response_tokens,
+                "token_loss_mean": token_loss_mean,
+            },
+            "optimizer_update": {
+                "status": "pass" if optimizer_ok else "fail",
+                "grad_norm": grad_norm,
+                "learning_rate": actor_metrics.get("actor/lr"),
+            },
+            "memory": {
+                "status": "pass" if memory_ok else "fail",
+                "max_memory_allocated_gb": memory_allocated,
+                "max_memory_reserved_gb": memory_reserved,
+                "cpu_memory_used_gb": actor_metrics.get("actor/perf/cpu_memory_used_gb"),
+            },
+        }
+        self._opsd_test_report["steps"].append(
+            {
+                "global_step": self.global_steps,
+                "modules": step_modules,
+                "samples": records,
+            }
+        )
+        for module_name, result in step_modules.items():
+            previous = self._opsd_test_report["modules"][module_name]["status"]
+            self._opsd_test_report["modules"][module_name]["status"] = (
+                "fail" if previous == "fail" or result["status"] == "fail" else "pass"
+            )
+        if is_last_step:
+            statuses = [module["status"] for module in self._opsd_test_report["modules"].values()]
+            self._opsd_test_report["status"] = "pass" if all(status == "pass" for status in statuses) else "fail"
+        self._write_opsd_test_report()
 
     def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
         """Dump rollout/validation samples as JSONL asynchronously."""
@@ -1489,6 +1701,11 @@ class RayPPOTrainer:
 
     def _prepare_opsd_teacher_inputs(self, batch: DataProto):
         # OPSD worker 内部会消费这些 teacher_* 张量；这里不在 RayTrainer 里算 teacher logits。
+        student_input_ids_before = batch.batch["input_ids"].clone() if self._opsd_test_is_enabled_for_step() else None
+        student_responses_before = batch.batch["responses"].clone() if self._opsd_test_is_enabled_for_step() else None
+        student_response_mask_before = (
+            batch.batch["response_mask"].clone() if self._opsd_test_is_enabled_for_step() else None
+        )
         batch, metrics = self._attach_opsd_teacher_privileged_info(batch)
         teacher_batch, teacher_batch_metrics = self._build_opsd_teacher_batch(batch)
         metrics.update(teacher_batch_metrics)
@@ -1501,9 +1718,25 @@ class RayPPOTrainer:
             "opsd_teacher_response_mask": teacher_batch.batch["response_mask"],
         }
         batch = batch.union(DataProto.from_single_dict(teacher_input_data))
+        if self._opsd_test_is_enabled_for_step():
+            self._opsd_test_privileged_input_evidence = {
+                "num_samples": len(batch.batch),
+                "student_input_ids_unchanged": bool(
+                    torch.equal(student_input_ids_before, batch.batch["input_ids"])
+                ),
+                "teacher_response_ids_match_student": bool(
+                    torch.equal(student_responses_before, teacher_batch.batch["responses"])
+                ),
+                "teacher_response_mask_matches_student": bool(
+                    torch.equal(student_response_mask_before, teacher_batch.batch["response_mask"])
+                ),
+                "teacher_prompt_mean_len": teacher_batch_metrics["opsd/teacher_prompt/mean_len"],
+                "teacher_prompt_max_len": teacher_batch_metrics["opsd/teacher_prompt/max_len"],
+                "privileged_input_mode": self.opsd_teacher_privileged_input_mode,
+            }
         return batch, metrics
 
-    def _update_actor_opsd(self, batch: DataProto) -> DataProto:
+    def _update_actor_opsd(self, batch: DataProto) -> tuple[DataProto, list[dict]]:
         # OPSD 专用 actor 更新入口：full vocab logits 只能在 worker 的 microbatch 内部被消费。
         required_teacher_keys = (
             "opsd_teacher_prompts",
@@ -1529,13 +1762,11 @@ class RayPPOTrainer:
             calculate_entropy=False,
             distillation_use_topk=False,
             opsd_use_logits_processor=True,
-            opsd_loss_mode=loss_cfg.get("loss_mode", "full_vocab_kl"),
             opsd_kl_mode=loss_cfg.get("kl_mode", "reverse_kl"),
             opsd_rl_coupling=loss_cfg.get("rl_coupling", "none"),
-            opsd_topk_strategy=loss_cfg.get("topk_strategy", "full"),
+            opsd_vocab_strategy=loss_cfg.get("vocab_strategy", "full"),
             opsd_student_topk=loss_cfg.get("student_topk", 8),
-            opsd_teacher_topk=loss_cfg.get("teacher_topk", 8),
-            opsd_use_tail=loss_cfg.get("use_tail", loss_cfg.get("topk_strategy", "full") != "full"),
+            opsd_chunked_topk_chunk_size=loss_cfg.get("chunked_topk_chunk_size", 4096),
             opsd_loss_coef=loss_cfg.get("loss_coef", 1.0),
             opsd_temperature=loss_cfg.get("temperature", 1.0),
             temperature=loss_cfg.get("temperature", 1.0),
@@ -1545,13 +1776,20 @@ class RayPPOTrainer:
             seed=actor_config.data_loader_seed,
             dataloader_kwargs={"shuffle": actor_config.shuffle},
             compute_loss=True,
+            opsd_test_enabled=self._opsd_test_is_enabled_for_step(),
+            opsd_test_global_step=self.global_steps,
+            opsd_test_topk=int(self.opsd_test_config.get("topk", 5)),
+            opsd_test_max_samples=int(self.opsd_test_config.get("max_samples_per_worker_micro_batch", 2)),
+            opsd_test_max_response_tokens=int(self.opsd_test_config.get("max_response_tokens_per_sample", 32)),
+            opsd_test_max_loss_vocab_tokens=int(self.opsd_test_config.get("max_loss_vocab_tokens", 32)),
         )
         actor_output = self.actor_rollout_wg.update_actor_opsd(batch_td)
         actor_output = tu.get(actor_output, "metrics")
+        test_records = self._decode_opsd_test_records(actor_output.pop("opsd_test_records_json", None))
         actor_output = rename_dict(actor_output, "actor/")
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
-        return actor_output
+        return actor_output, test_records
 
     def _post_actor_update(self, timing_raw: dict, is_last_step: bool):
         # actor 参数更新完成后，保存 checkpoint 并把新权重同步给 rollout replica。
@@ -1818,10 +2056,22 @@ class RayPPOTrainer:
                             metrics.update(opsd_teacher_metrics)
 
                         with marked_timer("update_actor_opsd", timing_raw, color="red"):
-                            actor_output = self._update_actor_opsd(batch)
+                            actor_output, opsd_test_records = self._update_actor_opsd(batch)
 
                         self._post_actor_update(timing_raw=timing_raw, is_last_step=is_last_step)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                        token_loss_sum = actor_output_metrics.get("actor/opsd_token_loss_sum")
+                        response_tokens = actor_output_metrics.get("actor/opsd_response_tokens")
+                        if token_loss_sum is None or response_tokens is None:
+                            raise KeyError(
+                                "OPSD actor metrics require actor/opsd_token_loss_sum and actor/opsd_response_tokens."
+                            )
+                        actor_output_metrics["actor/opsd_token_loss_mean"] = token_loss_sum / max(response_tokens, 1)
+                        self._record_opsd_test_step(
+                            records=opsd_test_records,
+                            actor_metrics=actor_output_metrics,
+                            is_last_step=is_last_step,
+                        )
                         metrics.update(actor_output_metrics)
                     else:
                         with marked_timer("reward", timing_raw, color="yellow"):

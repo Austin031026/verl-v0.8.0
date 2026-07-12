@@ -325,11 +325,15 @@ class TaskRunner:
             collate_fn=collate_fn,
             train_sampler=train_sampler,
         )
-        # Initialize the workers of the trainer.
-        trainer.init_workers()
+        try:
+            # Initialize the workers of the trainer.
+            trainer.init_workers()
 
-        # Start the training process.
-        trainer.fit()
+            # Start the training process.
+            trainer.fit()
+        except Exception as exc:
+            trainer.record_opsd_test_failure(stage="init_workers_or_fit", error=exc)
+            raise
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=True, max_samples: int = -1):

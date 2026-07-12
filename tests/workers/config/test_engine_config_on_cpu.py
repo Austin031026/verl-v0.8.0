@@ -50,7 +50,13 @@ class TestFSDPEngineConfigCPU:
         config = FSDPEngineConfig()
         assert config.param_offload is False
         assert config.optimizer_offload is False
+        assert config.forward_only_cpu_offload is True
         assert config.fsdp_size == -1
+
+    def test_forward_only_cpu_offload_is_mutable(self):
+        config = FSDPEngineConfig(forward_only=True)
+        config.forward_only_cpu_offload = False
+        assert config.forward_only_cpu_offload is False
 
     @pytest.mark.parametrize(
         "offload_params",

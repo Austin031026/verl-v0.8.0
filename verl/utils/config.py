@@ -152,20 +152,55 @@ def validate_config(
 
     opsd_config = config.get("opsd", None)
     opsd_enabled = bool(opsd_config is not None and opsd_config.get("enabled", False))
+    opsd_test_config = opsd_config.get("test", {}) if opsd_config is not None else {}
+    opsd_test_enabled = bool(opsd_test_config.get("enabled", False))
+    if opsd_test_enabled and not opsd_enabled:
+        raise ValueError("opsd.test.enabled=True requires opsd.enabled=True.")
+    if opsd_test_enabled:
+        positive_test_fields = (
+            "topk",
+            "max_samples_per_step",
+            "max_samples_per_worker_micro_batch",
+            "max_response_tokens_per_sample",
+            "max_loss_vocab_tokens",
+        )
+        for field in positive_test_fields:
+            value = opsd_test_config.get(field, None)
+            if value is None or int(value) <= 0:
+                raise ValueError(f"opsd.test.{field} must be greater than 0 when OPSD test mode is enabled.")
+        steps = [int(step) for step in opsd_test_config.get("steps", [])]
+        if any(step <= 0 for step in steps):
+            raise ValueError("opsd.test.steps must contain only positive training step numbers.")
+        if not opsd_test_config.get("output_path", None):
+            raise ValueError("opsd.test.output_path must be set when OPSD test mode is enabled.")
     if opsd_enabled:
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
-        if real_train_batch_size != actor_config.ppo_mini_batch_size:
+        if config.data.train_batch_size != actor_config.ppo_mini_batch_size:
             raise ValueError(
                 "Strict OPSD requires one actor update per rollout batch, so "
-                "data.train_batch_size * actor_rollout_ref.rollout.n must equal "
+                "data.train_batch_size must equal "
                 "actor_rollout_ref.actor.ppo_mini_batch_size. "
-                f"Got {config.data.train_batch_size=} * {config.actor_rollout_ref.rollout.n=} "
-                f"= {real_train_batch_size}, but {actor_config.ppo_mini_batch_size=}."
+                "Both values are multiplied by actor_rollout_ref.rollout.n after rollout repetition. "
+                f"Got {config.data.train_batch_size=}, but {actor_config.ppo_mini_batch_size=}."
             )
         if actor_config.ppo_epochs != 1:
             raise ValueError(
-                "Strict OPSD requires actor_rollout_ref.actor.ppo_epochs=1 so the rollout policy "
-                f"matches the policy used for OPSD loss computation. Got {actor_config.ppo_epochs=}."
+                "Strict OPSD consumes each rollout batch exactly once. Set "
+                "actor_rollout_ref.actor.ppo_epochs=1, and use trainer.total_training_steps for multiple fresh "
+                f"rollout/update cycles. Got {actor_config.ppo_epochs=}."
+            )
+        if actor_config.shuffle:
+            raise ValueError(
+                "Strict OPSD requires actor_rollout_ref.actor.shuffle=False because the shared teacher/student "
+                "micro-batch plan is generated before the actor mini-batch iterator."
+            )
+        actor_fsdp_config = getattr(actor_config, "fsdp_config", None)
+        actor_sp_size = max(
+            int(getattr(actor_config, "ulysses_sequence_parallel_size", 1)),
+            int(getattr(actor_fsdp_config, "ulysses_sequence_parallel_size", 1)),
+        )
+        if actor_sp_size != 1:
+            raise NotImplementedError(
+                "OPSD teacher full-vocab forward currently requires ulysses_sequence_parallel_size=1."
             )
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:

@@ -23,6 +23,38 @@ from verl.utils.ulysses import (
 from verl.workers.config import DistillationConfig, DistillationLossConfig
 
 
+def _chunked_topk_log_probs(
+    logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    chunk_size: int = 4096,
+) -> torch.Tensor:
+    """Compute selected full-softmax log probabilities without a full fp32 log-softmax buffer."""
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be greater than 0, got {chunk_size}.")
+    if logits.shape[:-1] != topk_ids.shape[:-1]:
+        raise ValueError(
+            "logits and topk_ids must have matching token dimensions, "
+            f"got {tuple(logits.shape)} and {tuple(topk_ids.shape)}."
+        )
+
+    *leading_shape, vocab_size = logits.shape
+    topk = topk_ids.shape[-1]
+    flat_logits = logits.reshape(-1, vocab_size)
+    flat_topk_ids = topk_ids.reshape(-1, topk)
+    num_tokens = flat_logits.shape[0]
+    if num_tokens == 0:
+        return torch.empty((*leading_shape, topk), dtype=logits.dtype, device=logits.device)
+
+    output = torch.empty((num_tokens, topk), dtype=logits.dtype, device=logits.device)
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        chunk_logits_fp32 = flat_logits[start:end].float()
+        chunk_log_z = torch.logsumexp(chunk_logits_fp32, dim=-1, keepdim=True)
+        chunk_topk_logits = torch.gather(chunk_logits_fp32, dim=-1, index=flat_topk_ids[start:end])
+        output[start:end] = (chunk_topk_logits - chunk_log_z).to(logits.dtype)
+    return output.reshape(*leading_shape, topk)
+
+
 def kl_divergence(log_q: torch.Tensor, log_p: torch.Tensor) -> torch.Tensor:
     """Compute KL divergence between two distributions given their log probabilities."""
     log_p = log_p.float()

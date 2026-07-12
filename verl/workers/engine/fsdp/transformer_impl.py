@@ -381,10 +381,10 @@ class FSDPEngine(BaseEngine):
             # - critic: None
             # - ref: CPUOffload(offload_params=True)
 
-            # We force reference policy to use CPUOffload to save memory.
-            # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
+            # Forward-only reference models use CPUOffload by default for backward compatibility.
+            # Callers such as an OPSD teacher can opt out and keep their local FSDP shards on GPU.
             cpu_offload = None
-            if self.engine_config.forward_only:
+            if self.engine_config.forward_only and self.engine_config.forward_only_cpu_offload:
                 cpu_offload = CPUOffload(offload_params=True)
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
@@ -411,7 +411,9 @@ class FSDPEngine(BaseEngine):
                 param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True
             )
             offload_policy = None
-            if self.engine_config.offload_policy or self.engine_config.forward_only:
+            if self.engine_config.offload_policy or (
+                self.engine_config.forward_only and self.engine_config.forward_only_cpu_offload
+            ):
                 self._is_offload_param = False
                 self._is_offload_optimizer = False
                 offload_policy = CPUOffloadPolicy(pin_memory=True)

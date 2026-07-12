@@ -14,6 +14,7 @@
 
 import os
 import random
+from collections.abc import Sequence
 
 import numpy as np
 import torch
@@ -21,9 +22,183 @@ from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
-from verl.utils.device import is_npu_available
+from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.py_functional import append_to_dict
-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+from verl.utils.seqlen_balancing import (
+    get_seqlen_balanced_partitions,
+    rearrange_micro_batches,
+    restore_dynamic_batch,
+)
+
+
+def build_balanced_micro_batch_indices(
+    primary_lengths: Sequence[int],
+    secondary_lengths: Sequence[int],
+    num_micro_batches: int,
+    primary_token_budget: int | None = None,
+    secondary_token_budget: int | None = None,
+    max_micro_batch_size: int | None = None,
+) -> list[list[int]] | None:
+    """Balance by primary lengths while enforcing both token budgets."""
+    primary_lengths = [int(length) for length in primary_lengths]
+    secondary_lengths = [int(length) for length in secondary_lengths]
+    batch_size = len(primary_lengths)
+
+    if batch_size == 0:
+        raise ValueError("Cannot build micro-batches for an empty batch.")
+    if len(secondary_lengths) != batch_size:
+        raise ValueError(
+            "Primary and secondary length lists must have the same size, "
+            f"got {batch_size} and {len(secondary_lengths)}."
+        )
+    if any(length <= 0 for length in primary_lengths + secondary_lengths):
+        raise ValueError("All sequence lengths must be greater than zero.")
+    if not 1 <= num_micro_batches <= batch_size:
+        raise ValueError(f"num_micro_batches must be in [1, {batch_size}], got {num_micro_batches}.")
+    for name, value in (
+        ("primary_token_budget", primary_token_budget),
+        ("secondary_token_budget", secondary_token_budget),
+        ("max_micro_batch_size", max_micro_batch_size),
+    ):
+        if value is not None and value <= 0:
+            raise ValueError(f"{name} must be greater than zero, got {value}.")
+
+    partitions = get_seqlen_balanced_partitions(
+        seqlen_list=primary_lengths,
+        k_partitions=num_micro_batches,
+        equal_size=False,
+    )
+    partitions.sort(
+        key=lambda partition: (
+            sum(primary_lengths[index] for index in partition),
+            sum(secondary_lengths[index] for index in partition),
+            partition[0],
+        ),
+        reverse=True,
+    )
+
+    for partition in partitions:
+        if max_micro_batch_size is not None and len(partition) > max_micro_batch_size:
+            return None
+        if primary_token_budget is not None and (
+            sum(primary_lengths[index] for index in partition) > primary_token_budget
+        ):
+            return None
+        if secondary_token_budget is not None and (
+            sum(secondary_lengths[index] for index in partition) > secondary_token_budget
+        ):
+            return None
+    return partitions
+
+
+def compute_masked_loss_stats(losses: torch.Tensor, loss_mask: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    """Return sum, count, min, and max without failing on an empty mask."""
+    if losses.shape != loss_mask.shape:
+        raise ValueError(
+            f"losses and loss_mask must have the same shape, got {tuple(losses.shape)} and {tuple(loss_mask.shape)}."
+        )
+    loss_mask = loss_mask.bool()
+    valid_sum = (losses * loss_mask).sum()
+    valid_count = loss_mask.sum()
+    if losses.numel() == 0:
+        return valid_sum, valid_count, losses.new_tensor(float("inf")), losses.new_tensor(float("-inf"))
+    valid_min = losses.masked_fill(~loss_mask, float("inf")).min()
+    valid_max = losses.masked_fill(~loss_mask, float("-inf")).max()
+    return valid_sum, valid_count, valid_min, valid_max
+
+
+def reduce_distributed_int(value: int, op, dp_group=None, collective_device=None) -> int:
+    if not torch.distributed.is_initialized():
+        return int(value)
+    collective_device = collective_device or get_device_name()
+    reduced = torch.tensor(int(value), dtype=torch.long, device=collective_device)
+    torch.distributed.all_reduce(reduced, op=op, group=dp_group)
+    return int(reduced.item())
+
+
+def raise_if_any_rank_has_errors(
+    local_errors: Sequence[str],
+    dp_group=None,
+    collective_device=None,
+    error_prefix: str = "Distributed validation failed",
+) -> None:
+    """Raise the same validation error on every rank when any rank reports an error."""
+    local_errors = list(local_errors)
+    any_error = reduce_distributed_int(
+        bool(local_errors),
+        op=torch.distributed.ReduceOp.MAX,
+        dp_group=dp_group,
+        collective_device=collective_device,
+    )
+    if not any_error:
+        return
+
+    if torch.distributed.is_initialized():
+        gathered_errors = [None] * torch.distributed.get_world_size(group=dp_group)
+        torch.distributed.all_gather_object(gathered_errors, local_errors, group=dp_group)
+        rank_errors = {rank: errors for rank, errors in enumerate(gathered_errors) if errors}
+    else:
+        rank_errors = {0: local_errors}
+    raise ValueError(f"{error_prefix}: {rank_errors}.")
+
+
+def build_synchronized_balanced_micro_batch_indices(
+    primary_lengths: Sequence[int],
+    secondary_lengths: Sequence[int],
+    local_num_micro_batches: int,
+    primary_token_budget: int | None = None,
+    secondary_token_budget: int | None = None,
+    max_micro_batch_size: int | None = None,
+    dp_group=None,
+    collective_device=None,
+) -> list[list[int]]:
+    """Build a budget-valid local plan with one shared micro-batch count across DP ranks."""
+    batch_size = len(primary_lengths)
+    min_batch_size = reduce_distributed_int(
+        batch_size,
+        op=torch.distributed.ReduceOp.MIN,
+        dp_group=dp_group,
+        collective_device=collective_device,
+    )
+    max_batch_size = reduce_distributed_int(
+        batch_size,
+        op=torch.distributed.ReduceOp.MAX,
+        dp_group=dp_group,
+        collective_device=collective_device,
+    )
+    if min_batch_size != max_batch_size:
+        raise ValueError(
+            "Joint batching requires the same local sample count on every DP rank, "
+            f"got min={min_batch_size}, max={max_batch_size}."
+        )
+
+    group_count = reduce_distributed_int(
+        local_num_micro_batches,
+        op=torch.distributed.ReduceOp.MAX,
+        dp_group=dp_group,
+        collective_device=collective_device,
+    )
+    while group_count <= batch_size:
+        partitions = build_balanced_micro_batch_indices(
+            primary_lengths=primary_lengths,
+            secondary_lengths=secondary_lengths,
+            num_micro_batches=group_count,
+            primary_token_budget=primary_token_budget,
+            secondary_token_budget=secondary_token_budget,
+            max_micro_batch_size=max_micro_batch_size,
+        )
+        any_partition_failed = reduce_distributed_int(
+            partitions is None,
+            op=torch.distributed.ReduceOp.MAX,
+            dp_group=dp_group,
+            collective_device=collective_device,
+        )
+        if not any_partition_failed:
+            assert partitions is not None
+            return partitions
+        group_count += 1
+
+    raise RuntimeError("Unable to build a synchronized micro-batch plan even with singleton groups.")
 
 
 def enable_full_determinism(seed: int):
@@ -66,6 +241,24 @@ def prepare_micro_batches(
     """
     Prepare micro batches from data.
     """
+    precomputed_indices = tu.get_non_tensor_data(data=data, key="precomputed_micro_batch_indices", default=None)
+    if precomputed_indices is not None:
+        normalized_indices = []
+        for partition in precomputed_indices:
+            partition = [int(index) for index in partition]
+            if not partition:
+                raise ValueError("Precomputed micro-batch partitions must be non-empty.")
+            normalized_indices.append(partition)
+
+        flattened_indices = [index for partition in normalized_indices for index in partition]
+        if sorted(flattened_indices) != list(range(len(data))):
+            raise ValueError(
+                "Precomputed micro-batch indices must cover every batch row exactly once, "
+                f"got indices={normalized_indices} for batch_size={len(data)}."
+            )
+        micro_batches = [tu.index_select_tensor_dict(data, partition) for partition in normalized_indices]
+        return micro_batches, normalized_indices
+
     use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
     sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
 
@@ -105,7 +298,6 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
     each losses_reduced contains 1. model_output, 2. loss, 3. metrics.
     """
 
-    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
     pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
     assert pad_mode == DatasetPadMode.NO_PADDING, "postprocess_batch_func only support NO_PADDING pad_mode"
 
@@ -136,8 +328,8 @@ def postprocess_batch_func(output_lst, indices, data: TensorDict):
         else:
             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
 
-        # reverse with dynamic bsz
-        if use_dynamic_bsz:
+        # Restore the original row order after dynamic or precomputed batching.
+        if indices is not None:
             model_output[key] = restore_dynamic_batch(model_output[key], indices)
 
     # loss
