@@ -1,0 +1,6 @@
+# label<TAB>backend<TAB>model or checkpoint path
+base_initial_posttrained	hf	Qwen/Qwen3-1.7B
+step25	fsdp	/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/opsd_runs/dapo_opsd_qwen3_1.7b_top16_8k_100step_20260713_021308/checkpoints/global_step_25/actor
+step50	fsdp	/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/opsd_runs/dapo_opsd_qwen3_1.7b_top16_8k_100step_20260713_021308/checkpoints/global_step_50/actor
+step75	fsdp	/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/opsd_runs/dapo_opsd_qwen3_1.7b_top16_8k_100step_20260713_021308/checkpoints/global_step_75/actor
+step100	fsdp	/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J/opsd_runs/dapo_opsd_qwen3_1.7b_top16_8k_100step_20260713_021308/checkpoints/global_step_100/actor

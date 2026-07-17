@@ -107,6 +107,59 @@ def compute_masked_loss_stats(losses: torch.Tensor, loss_mask: torch.Tensor) -> 
     return valid_sum, valid_count, valid_min, valid_max
 
 
+def build_response_prediction_indices(data: TensorDict) -> torch.Tensor:
+    """Map the selected response tokens to prediction positions in a packed sequence."""
+    input_ids = data["input_ids"]
+    attention_mask = data["attention_mask"]
+    responses = data["responses"]
+    response_mask = data["response_mask"]
+
+    if not input_ids.is_nested:
+        raise NotImplementedError("Response prediction indices require no-padding nested input_ids.")
+    if attention_mask.is_nested or responses.is_nested or response_mask.is_nested:
+        raise NotImplementedError("Response prediction indices require padded response metadata.")
+    if responses.shape != response_mask.shape:
+        raise ValueError(
+            "responses and response_mask must have the same shape, "
+            f"got {tuple(responses.shape)} and {tuple(response_mask.shape)}."
+        )
+    if attention_mask.shape[0] != responses.shape[0] or attention_mask.shape[1] < responses.shape[1]:
+        raise ValueError(
+            "attention_mask must contain the same batch and the response suffix, "
+            f"got attention={tuple(attention_mask.shape)}, responses={tuple(responses.shape)}."
+        )
+
+    sequence_lengths = input_ids.offsets().diff().to(torch.long)
+    attention_lengths = attention_mask.sum(dim=-1).to(torch.long)
+    if not torch.equal(sequence_lengths.cpu(), attention_lengths.cpu()):
+        raise ValueError(
+            "No-padding sequence lengths must match attention_mask lengths, "
+            f"got nested={sequence_lengths.tolist()}, attention={attention_lengths.tolist()}."
+        )
+
+    response_attention_mask = attention_mask[:, -responses.shape[1] :].bool()
+    effective_response_mask = response_mask.bool() & response_attention_mask
+    response_lengths = response_attention_mask.sum(dim=-1).to(torch.long)
+    sequence_starts = input_ids.offsets()[:-1].to(torch.long)
+
+    selected_indices = []
+    for sample_index in range(len(data)):
+        prompt_length = int((sequence_lengths[sample_index] - response_lengths[sample_index]).item())
+        if prompt_length <= 0 and bool(effective_response_mask[sample_index].any()):
+            raise ValueError("Response prediction requires at least one prompt token before the response.")
+
+        # Response columns may contain padding. Their cumulative valid-token rank
+        # maps each selected response token to its position in the packed sequence.
+        response_ranks = response_attention_mask[sample_index].long().cumsum(dim=0) - 1
+        first_prediction_index = int(sequence_starts[sample_index].item()) + prompt_length - 1
+        sample_indices = first_prediction_index + response_ranks
+        selected_indices.append(sample_indices[effective_response_mask[sample_index]])
+
+    if not selected_indices:
+        return torch.empty(0, dtype=torch.long, device=input_ids.values().device)
+    return torch.cat(selected_indices).to(device=input_ids.values().device, dtype=torch.long)
+
+
 def reduce_distributed_int(value: int, op, dp_group=None, collective_device=None) -> int:
     if not torch.distributed.is_initialized():
         return int(value)

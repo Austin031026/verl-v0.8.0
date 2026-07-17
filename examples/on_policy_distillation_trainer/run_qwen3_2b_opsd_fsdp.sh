@@ -20,6 +20,7 @@ ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-32}
 max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
 max_response_length=${MAX_RESPONSE_LENGTH:-1024}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-12288}
+enable_thinking=${ENABLE_THINKING:-True}
 
 actor_lr=${ACTOR_LR:-1e-6}
 
@@ -39,8 +40,13 @@ opsd_teacher_update_mode=${OPSD_TEACHER_UPDATE_MODE:-none}
 
 # Teacher forward uses dynamic token-budgeted micro-batches by default.
 opsd_teacher_use_dynamic_bsz=${OPSD_TEACHER_USE_DYNAMIC_BSZ:-True}
-# Teacher forward token budget per GPU; default matches actor log-prob forward.
-opsd_teacher_max_token_len_per_gpu=${OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU:-$ppo_max_token_len_per_gpu}
+# Maximum tokenized question + privileged information + chat-template prefix.
+opsd_teacher_max_prompt_length=${OPSD_TEACHER_MAX_PROMPT_LENGTH:-12288}
+# Total teacher input limits include the student rollout response.
+opsd_teacher_max_context_no_think=${OPSD_TEACHER_MAX_CONTEXT_NO_THINK:-16000}
+opsd_teacher_max_context_thinking=${OPSD_TEACHER_MAX_CONTEXT_THINKING:-32000}
+# Teacher forward token budget per GPU; it must fit at least one teacher sequence.
+opsd_teacher_max_token_len_per_gpu=${OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU:-16000}
 # Teacher fixed micro-batch size per GPU; only used when dynamic batching is disabled.
 opsd_teacher_micro_batch_size_per_gpu=${OPSD_TEACHER_MICRO_BATCH_SIZE_PER_GPU:-null}
 # Teacher removes padding during forward to match the actor model input path.
@@ -149,20 +155,20 @@ case "${opsd_teacher_update_mode}" in
 esac
 
 # OPSD teacher privileged input source:
-#   answer        - use the current sample's final answer/ground truth; first implemented path
-#   answer_reason - reserved for answer plus reasoning/rationale
-#   cot_examples  - reserved for shared or retrieved CoT demonstrations
+#   answer       - use the current sample's final answer/ground truth
+#   reason       - use the current sample's teacher reasoning/rationale
+#   cot_examples - reserved for shared or retrieved CoT demonstrations
 case "${opsd_teacher_privileged_input_mode}" in
-    answer)
+    answer|reason)
         ;;
-    answer_reason|cot_examples)
+    cot_examples)
         echo "OPSD_TEACHER_PRIVILEGED_INPUT_MODE=${opsd_teacher_privileged_input_mode}" \
             "is reserved but not implemented yet." >&2
         exit 1
         ;;
     *)
         echo "Invalid OPSD_TEACHER_PRIVILEGED_INPUT_MODE=${opsd_teacher_privileged_input_mode}." \
-            "Expected one of: answer, answer_reason, cot_examples." >&2
+            "Expected one of: answer, reason, cot_examples." >&2
         exit 1
         ;;
 esac
@@ -176,6 +182,7 @@ DATA=(
     data.train_batch_size=${train_batch_size}
     data.max_prompt_length=${max_prompt_length}
     data.max_response_length=${max_response_length}
+    +data.apply_chat_template_kwargs.enable_thinking=${enable_thinking}
     data.filter_overlong_prompts=True
     data.truncation='error'
     data.shuffle=True
@@ -239,8 +246,14 @@ OPSD=(
     +opsd.teacher.model_path="$OPSD_TEACHER_MODEL"
     +opsd.teacher.share_actor_worker=True
     # Controls how teacher-only privileged information is added before teacher forward.
-    # Only answer is implemented first; answer_reason/cot_examples are reserved hooks.
+    # answer and reason are implemented; cot_examples remains a reserved hook.
     +opsd.teacher.privileged_input.mode=${opsd_teacher_privileged_input_mode}
+    # Limit the exact tokenized teacher prefix after question, privileged input,
+    # and the chat template have been combined.
+    +opsd.teacher.max_prompt_length=${opsd_teacher_max_prompt_length}
+    # Limit the complete teacher sequence independently for no-think/thinking templates.
+    +opsd.teacher.max_context_length.no_think=${opsd_teacher_max_context_no_think}
+    +opsd.teacher.max_context_length.thinking=${opsd_teacher_max_context_thinking}
     # Use token-budgeted dynamic micro-batching for teacher forward.
     +opsd.teacher.use_dynamic_bsz=${opsd_teacher_use_dynamic_bsz}
     # Maximum teacher forward tokens per GPU when dynamic batching is enabled.

@@ -54,7 +54,11 @@ if __name__ == "__main__":
     train_dataset = dataset["train"]
     test_dataset = dataset["test"]
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    instruction_following = (
+        "Solve the problem. You may show your reasoning. End your response with exactly one final-answer line in "
+        "the format `\\boxed{18}`, replacing 18 with the single numeric answer. Do not include units or text inside "
+        "the box, do not box intermediate results, and do not write anything after the final line."
+    )
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):

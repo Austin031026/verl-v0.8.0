@@ -73,7 +73,12 @@ from verl.workers.config import FSDPEngineConfig, FSDPOptimizerConfig, HFModelCo
 from verl.workers.utils.padding import build_attention_mask_from_nested
 
 from ..base import BaseEngine, BaseEngineCtx, EngineRegistry
-from ..utils import enable_full_determinism, postprocess_batch_func, prepare_micro_batches
+from ..utils import (
+    build_response_prediction_indices,
+    enable_full_determinism,
+    postprocess_batch_func,
+    prepare_micro_batches,
+)
 from .utils import create_device_mesh, get_sharding_strategy
 
 logger = logging.getLogger(__file__)
@@ -1064,6 +1069,20 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_inputs.update(multi_modal_inputs)
         model_inputs.update(extra_args)
 
+        opsd_use_logits_processor = tu.get_non_tensor_data(
+            data=micro_batch, key="opsd_use_logits_processor", default=False
+        )
+        if opsd_use_logits_processor:
+            if not use_remove_padding:
+                raise NotImplementedError("OPSD logits_to_keep requires use_remove_padding=True.")
+            if self.use_ulysses_sp:
+                raise NotImplementedError("OPSD logits_to_keep does not support Ulysses sequence parallelism yet.")
+            logits_to_keep = build_response_prediction_indices(micro_batch)
+            if logits_to_keep.numel() == 0:
+                raise ValueError("An OPSD micro-batch must select at least one response token.")
+            model_inputs["logits_to_keep"] = logits_to_keep
+            output_args["opsd_logits_to_keep"] = logits_to_keep
+
         return model_inputs, output_args
 
     def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
@@ -1079,7 +1098,38 @@ class FSDPEngineWithLMHead(FSDPEngine):
             data=micro_batch, key="opsd_use_logits_processor", default=False
         )
         if opsd_use_logits_processor and use_fused_kernels:
-            raise NotImplementedError("OPSD full-vocab loss needs materialized logits; fused kernels are unsupported.")
+            raise NotImplementedError(
+                "OPSD selected logits need a materialized LM head; fused kernels are unsupported."
+            )
+
+        if opsd_use_logits_processor:
+            if logits_processor_func is None:
+                raise ValueError("OPSD logits processing requires a loss function.")
+            logits_to_keep = output_args["opsd_logits_to_keep"]
+            logits = output.logits.squeeze(0)
+            if logits.shape[0] != logits_to_keep.numel():
+                raise ValueError(
+                    "OPSD model output must contain exactly the selected prediction positions, "
+                    f"got logits={tuple(logits.shape)}, selected={logits_to_keep.numel()}."
+                )
+            temperature = output_args["temperature_rmpad"].index_select(0, logits_to_keep)
+            logits.div_(temperature.clamp(min=1e-8).unsqueeze(-1).to(logits.dtype))
+            selected_outputs = logits_processor_func(student_logits=logits.unsqueeze(0), data=micro_batch)
+
+            model_output = {}
+            cu_seqlens = micro_batch["input_ids"].offsets()
+            total_tokens = micro_batch["input_ids"].values().shape[0]
+            for key, value in selected_outputs.items():
+                value = value.squeeze(0)
+                if value.shape != logits_to_keep.shape:
+                    raise ValueError(
+                        f"OPSD selected output {key!r} must have shape {tuple(logits_to_keep.shape)}, "
+                        f"got {tuple(value.shape)}."
+                    )
+                full_sequence_value = value.new_zeros(total_tokens)
+                full_sequence_value.index_copy_(0, logits_to_keep, value)
+                model_output[key] = torch.nested.nested_tensor_from_jagged(full_sequence_value, cu_seqlens)
+            return model_output
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -1142,7 +1192,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
 
                 # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
-                if distillation_use_topk or opsd_use_logits_processor:
+                if distillation_use_topk:
                     outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                     cu_seqlens = input_ids.offsets()
                     for k, v in outputs.items():
@@ -1225,7 +1275,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     # (log_probs is also not gathered) and pad_size is only
                     # populated in output_args along the use_remove_padding=True
                     # path of prepare_model_inputs.
-                    if distillation_use_topk or opsd_use_logits_processor:
+                    if distillation_use_topk:
                         outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
                         for k, v in outputs.items():
                             v = v.squeeze(0)

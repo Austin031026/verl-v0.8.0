@@ -14,6 +14,7 @@
 
 import os
 import socket
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,13 +23,35 @@ import torch.multiprocessing as mp
 from tensordict import TensorDict
 
 from verl.utils import tensordict_utils as tu
+from verl.workers.engine.fsdp.transformer_impl import FSDPEngineWithLMHead
 from verl.workers.engine.utils import (
     build_balanced_micro_batch_indices,
+    build_response_prediction_indices,
     build_synchronized_balanced_micro_batch_indices,
     compute_masked_loss_stats,
     prepare_micro_batches,
     raise_if_any_rank_has_errors,
 )
+from verl.workers.engine_workers import ActorRolloutRefWorker
+
+
+def _make_opsd_no_padding_batch(sequences, attention_mask, responses, response_mask):
+    input_ids = torch.nested.as_nested_tensor(
+        [torch.tensor(sequence, dtype=torch.long) for sequence in sequences], layout=torch.jagged
+    )
+    position_ids = torch.nested.as_nested_tensor(
+        [torch.arange(len(sequence), dtype=torch.long) for sequence in sequences], layout=torch.jagged
+    )
+    return TensorDict(
+        {
+            "input_ids": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "responses": torch.tensor(responses, dtype=torch.long),
+            "response_mask": torch.tensor(response_mask, dtype=torch.long),
+        },
+        batch_size=[len(sequences)],
+    )
 
 
 def _distributed_opsd_batching_worker(rank: int, world_size: int, init_method: str):
@@ -190,6 +213,105 @@ def test_masked_loss_stats_handle_an_empty_response_mask():
     assert valid_count.item() == 0
     assert torch.isposinf(valid_min)
     assert torch.isneginf(valid_max)
+
+
+def test_opsd_student_and_teacher_build_distinct_aligned_prediction_indices():
+    responses = [[31, 32], [41, 42]]
+    response_mask = [[1, 0], [0, 1]]
+    student_data = _make_opsd_no_padding_batch(
+        sequences=[[11, 12, 31, 32], [21, 41, 42]],
+        attention_mask=[[1, 1, 1, 1], [0, 1, 1, 1]],
+        responses=responses,
+        response_mask=response_mask,
+    )
+    teacher_data = _make_opsd_no_padding_batch(
+        sequences=[[11, 12, 13, 14, 31, 32], [21, 22, 23, 41, 42]],
+        attention_mask=[[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 1]],
+        responses=responses,
+        response_mask=response_mask,
+    )
+
+    student_indices = build_response_prediction_indices(student_data)
+    teacher_indices = build_response_prediction_indices(teacher_data)
+
+    assert student_indices.tolist() == [1, 5]
+    assert teacher_indices.tolist() == [3, 9]
+    assert student_indices.numel() == teacher_indices.numel() == 2
+    torch.testing.assert_close(student_data["input_ids"].values()[student_indices + 1], torch.tensor([31, 42]))
+    torch.testing.assert_close(teacher_data["input_ids"].values()[teacher_indices + 1], torch.tensor([31, 42]))
+
+
+def test_fsdp_opsd_logits_to_keep_is_applied_and_scalar_losses_are_scattered():
+    data = _make_opsd_no_padding_batch(
+        sequences=[[11, 12, 31, 32], [21, 41, 42]],
+        attention_mask=[[1, 1, 1, 1], [0, 1, 1, 1]],
+        responses=[[31, 32], [41, 42]],
+        response_mask=[[1, 0], [0, 1]],
+    )
+    data["temperature"] = torch.ones(2)
+    tu.assign_non_tensor(
+        data,
+        use_remove_padding=True,
+        use_fused_kernels=False,
+        opsd_use_logits_processor=True,
+    )
+    engine = FSDPEngineWithLMHead.__new__(FSDPEngineWithLMHead)
+    engine.use_ulysses_sp = False
+
+    model_inputs, output_args = engine.prepare_model_inputs(data)
+    selected_indices = model_inputs["logits_to_keep"]
+    assert selected_indices.tolist() == [1, 5]
+
+    selected_logits = torch.arange(2 * 8, dtype=torch.float32).reshape(1, 2, 8)
+    output = SimpleNamespace(logits=selected_logits)
+
+    def selected_loss_processor(student_logits, data):
+        del data
+        return {"opsd_losses": student_logits.sum(dim=-1)}
+
+    model_output = engine.prepare_model_outputs(
+        output=output,
+        output_args=output_args,
+        micro_batch=data,
+        logits_processor_func=selected_loss_processor,
+    )
+
+    scattered_losses = model_output["opsd_losses"].values()
+    expected_losses = torch.zeros(7)
+    expected_losses[selected_indices] = selected_logits.squeeze(0).sum(dim=-1)
+    torch.testing.assert_close(scattered_losses, expected_losses)
+
+
+def test_opsd_teacher_forward_batch_reuses_student_response_tensors():
+    responses = torch.tensor([[31, 32], [41, 0]], dtype=torch.long)
+    response_mask = torch.tensor([[1, 1], [1, 0]], dtype=torch.long)
+    teacher_input_ids = torch.tensor(
+        [[11, 12, 21, 22, 31, 32], [0, 13, 23, 24, 41, 0]],
+        dtype=torch.long,
+    )
+    teacher_attention_mask = torch.tensor(
+        [[1, 1, 1, 1, 1, 1], [0, 1, 1, 1, 1, 0]],
+        dtype=torch.long,
+    )
+    teacher_position_ids = (teacher_attention_mask.cumsum(dim=-1) - 1).clamp(min=0)
+    data = TensorDict(
+        {
+            "responses": responses,
+            "response_mask": response_mask,
+            "opsd_teacher_input_ids": teacher_input_ids,
+            "opsd_teacher_attention_mask": teacher_attention_mask,
+            "opsd_teacher_position_ids": teacher_position_ids,
+        },
+        batch_size=[2],
+    )
+    worker = ActorRolloutRefWorker.__new__(ActorRolloutRefWorker)
+
+    teacher_data = worker._build_opsd_teacher_forward_batch(data)
+
+    assert "prompts" not in teacher_data
+    torch.testing.assert_close(teacher_data["responses"], responses)
+    torch.testing.assert_close(teacher_data["response_mask"], response_mask)
+    torch.testing.assert_close(teacher_data["input_ids"], teacher_input_ids)
 
 
 def test_opsd_group_count_and_validation_errors_are_synchronized_across_dp_ranks(tmp_path):

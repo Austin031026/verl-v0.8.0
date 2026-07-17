@@ -18,6 +18,7 @@ PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import hashlib
 import json
 import os
 import uuid
@@ -48,6 +49,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.opsd_metrics import finalize_opsd_actor_metrics
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
     Role,
@@ -361,11 +363,18 @@ class RayPPOTrainer:
             if self.use_opsd
             else "answer"
         )
+        opsd_teacher_config = self.opsd_config.get("teacher", {}) if self.use_opsd else {}
+        self.opsd_teacher_max_prompt_length = int(opsd_teacher_config.get("max_prompt_length", 12288))
+        self.opsd_teacher_max_context_length = opsd_teacher_config.get("max_context_length", None)
+        if self.use_opsd and self.opsd_teacher_max_prompt_length <= 0:
+            raise ValueError("OPSD teacher.max_prompt_length must be greater than 0.")
         self.opsd_test_config = self.opsd_config.get("test", {}) if self.use_opsd else {}
         self.opsd_test_enabled = bool(self.opsd_test_config.get("enabled", False))
         self.opsd_test_steps = {int(step) for step in self.opsd_test_config.get("steps", [])}
         self.opsd_test_output_path = None
+        self._opsd_test_rollout_projection_evidence = None
         self._opsd_test_privileged_input_evidence = None
+        self._opsd_test_actor_transport_evidence = None
         self._opsd_test_report = None
         if self.opsd_test_enabled:
             output_path = self.opsd_test_config.get("output_path", "opsd_test_result.json")
@@ -395,6 +404,7 @@ class RayPPOTrainer:
                     "rollout_lifecycle": {"status": "pending"},
                     "privileged_input": {"status": "pending"},
                     "teacher_batch": {"status": "pending"},
+                    "actor_transport": {"status": "pending"},
                     "teacher_student_alignment": {"status": "pending"},
                     "joint_micro_batching": {"status": "pending"},
                     "vocab_selection": {"status": "pending"},
@@ -568,6 +578,53 @@ class RayPPOTrainer:
         return self.opsd_test_enabled and (not self.opsd_test_steps or self.global_steps in self.opsd_test_steps)
 
     @staticmethod
+    def _opsd_test_text_sha256(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _opsd_test_token_ids_sha256(token_ids: list[int]) -> str:
+        payload = ",".join(str(int(token_id)) for token_id in token_ids)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _capture_opsd_test_rollout_projection(
+        self,
+        batch: DataProto,
+        gen_batch: DataProto,
+        reason_hashes_before: Optional[list[str]] = None,
+    ):
+        if not self._opsd_test_is_enabled_for_step():
+            return
+
+        controller_reward_models = batch.non_tensor_batch.get("reward_model")
+        rollout_reward_models = gen_batch.non_tensor_batch.get("reward_model")
+        controller_reason_hashes = []
+        if controller_reward_models is not None:
+            for reward_model in controller_reward_models:
+                reason = reward_model.get("reason") if isinstance(reward_model, dict) else None
+                controller_reason_hashes.append(
+                    self._opsd_test_text_sha256(reason) if isinstance(reason, str) else None
+                )
+
+        reason_absent_from_rollout_reward_model = bool(
+            rollout_reward_models is not None
+            and all(
+                isinstance(reward_model, dict) and "reason" not in reward_model
+                for reward_model in rollout_reward_models
+            )
+        )
+        reason_mode = self.opsd_teacher_privileged_input_mode == "reason"
+        self._opsd_test_rollout_projection_evidence = {
+            "privileged_input_mode": self.opsd_teacher_privileged_input_mode,
+            "reason_absent_from_rollout_reward_model": reason_absent_from_rollout_reward_model,
+            "legacy_top_level_reason_absent_from_rollout": "reason" not in gen_batch.non_tensor_batch,
+            "controller_reason_preserved": bool(
+                not reason_mode
+                or (reason_hashes_before is not None and reason_hashes_before == controller_reason_hashes)
+            ),
+            "num_samples": len(batch),
+        }
+
+    @staticmethod
     def _decode_opsd_test_records(values) -> list[dict]:
         records = []
         if values is None:
@@ -596,11 +653,42 @@ class RayPPOTrainer:
             or abs(token["loss_calculation"]["unreported_contribution"]) <= 1e-5
             for token in token_records
         )
+        rollout_projection_evidence = self._opsd_test_rollout_projection_evidence or {}
+        rollout_projection_ok = bool(
+            rollout_projection_evidence.get("reason_absent_from_rollout_reward_model")
+            and rollout_projection_evidence.get("legacy_top_level_reason_absent_from_rollout")
+            and rollout_projection_evidence.get("controller_reason_preserved")
+        )
         privileged_evidence = self._opsd_test_privileged_input_evidence or {}
         privileged_ok = bool(
             privileged_evidence.get("student_input_ids_unchanged")
             and privileged_evidence.get("teacher_response_ids_match_student")
-            and privileged_evidence.get("teacher_response_mask_matches_student")
+            and privileged_evidence.get("selected_text_matches_source")
+            and privileged_evidence.get("teacher_prompt_matches_expected")
+        )
+        actor_transport_evidence = self._opsd_test_actor_transport_evidence or {}
+        actor_transport_ok = bool(
+            actor_transport_evidence.get("raw_privileged_text_absent")
+            and actor_transport_evidence.get("reason_absent")
+            and actor_transport_evidence.get("teacher_tensor_inputs_present")
+        )
+        alignment_evidence = [
+            record.get("alignment_evidence", {}) for record in records if record.get("alignment_evidence")
+        ]
+        alignment_ok = bool(
+            records
+            and token_records
+            and alignment_evidence
+            and all(
+                evidence.get("teacher_response_mask_matches_student")
+                and evidence.get("student_selected_count") == evidence.get("teacher_selected_count")
+                and evidence.get("student_targets_match_rollout")
+                and evidence.get("teacher_targets_match_rollout")
+                and evidence.get("student_logits_finite")
+                and evidence.get("teacher_logits_finite")
+                for evidence in alignment_evidence
+            )
+            and all(token.get("target_ids_match_rollout", False) for token in token_records)
         )
         grad_norm = actor_metrics.get("actor/grad_norm")
         optimizer_ok = grad_norm is not None and np.isfinite(grad_norm) and grad_norm > 0
@@ -634,24 +722,42 @@ class RayPPOTrainer:
 
         step_modules = {
             "rollout_lifecycle": {
-                "status": "pass" if records and token_records and fresh_rollout else "fail",
+                "status": "pass" if records and token_records and fresh_rollout and rollout_projection_ok else "fail",
                 "fresh_rollout": fresh_rollout,
                 "rollout_sample_uids": sorted(current_uids),
+                "projection_evidence": rollout_projection_evidence,
             },
             "privileged_input": {
                 "status": "pass" if privileged_ok else "fail",
                 "evidence": privileged_evidence,
             },
             "teacher_batch": {
-                "status": "pass" if privileged_ok else "fail",
+                "status": "pass"
+                if privileged_ok
+                and privileged_evidence.get("teacher_prompt_within_limit")
+                and privileged_evidence.get("teacher_context_within_limit")
+                and alignment_evidence
+                and all(evidence.get("teacher_response_mask_matches_student") for evidence in alignment_evidence)
+                else "fail",
                 "response_ids_match": privileged_evidence.get("teacher_response_ids_match_student", False),
-                "response_mask_matches": privileged_evidence.get(
-                    "teacher_response_mask_matches_student", False
+                "response_mask_matches": bool(
+                    alignment_evidence
+                    and all(evidence.get("teacher_response_mask_matches_student") for evidence in alignment_evidence)
                 ),
+                "teacher_prompt_matches_expected": privileged_evidence.get(
+                    "teacher_prompt_matches_expected", False
+                ),
+                "prompt_within_limit": privileged_evidence.get("teacher_prompt_within_limit", False),
+                "context_within_limit": privileged_evidence.get("teacher_context_within_limit", False),
+            },
+            "actor_transport": {
+                "status": "pass" if actor_transport_ok else "fail",
+                "evidence": actor_transport_evidence,
             },
             "teacher_student_alignment": {
-                "status": "pass" if records and token_records else "fail",
+                "status": "pass" if alignment_ok else "fail",
                 "checked_response_tokens": len(token_records),
+                "evidence": alignment_evidence,
             },
             "joint_micro_batching": {
                 "status": "pass" if actor_metrics.get("actor/opsd_teacher_micro_batches", 0) > 0 else "fail",
@@ -801,6 +907,32 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        if self.use_opsd:
+            # Keep the complete controller batch for privileged teacher input
+            # construction. AgentLoop receives a projection without teacher-only
+            # reason text.
+            gen_batch = batch.select(
+                batch_keys=[],
+                non_tensor_batch_keys=list(batch.non_tensor_batch.keys()),
+                meta_info_keys=list(batch.meta_info.keys()),
+            )
+            gen_batch.non_tensor_batch.pop("reason", None)
+
+            reward_models = batch.non_tensor_batch.get("reward_model")
+            if reward_models is not None:
+                rollout_reward_models = np.empty(reward_models.shape, dtype=object)
+                for i, reward_model in enumerate(reward_models):
+                    if not isinstance(reward_model, dict):
+                        raise TypeError(
+                            "OPSD requires each reward_model to be a dict; "
+                            f"sample index {i} has type {type(reward_model).__name__}."
+                        )
+                    rollout_reward_model = dict(reward_model)
+                    rollout_reward_model.pop("reason", None)
+                    rollout_reward_models[i] = rollout_reward_model
+                gen_batch.non_tensor_batch["reward_model"] = rollout_reward_models
+            return gen_batch
+
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
@@ -815,6 +947,12 @@ class RayPPOTrainer:
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _merge_rollout_output(self, batch: DataProto, rollout_output: DataProto) -> DataProto:
+        """Merge rollout results while keeping the complete OPSD reward_model authoritative."""
+        if self.use_opsd:
+            rollout_output.non_tensor_batch.pop("reward_model", None)
+        return batch.union(rollout_output)
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -890,7 +1028,7 @@ class RayPPOTrainer:
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
-            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch = self._merge_rollout_output(test_batch, test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
             # Store original inputs
@@ -1569,12 +1707,36 @@ class RayPPOTrainer:
 
         return privileged_texts
 
+    def _build_opsd_reason_privileged_texts(self, batch: DataProto) -> list[str]:
+        reward_models = batch.non_tensor_batch.get("reward_model")
+        if reward_models is None:
+            raise KeyError("OPSD privileged input mode 'reason' requires batch.non_tensor_batch['reward_model'].")
+
+        privileged_texts = []
+        for i, reward_model in enumerate(reward_models):
+            if not isinstance(reward_model, dict):
+                raise TypeError(
+                    "OPSD privileged input mode 'reason' requires each reward_model "
+                    f"to be a dict; sample index {i} has type {type(reward_model).__name__}."
+                )
+
+            reason = reward_model.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                raise ValueError(
+                    "OPSD privileged input mode 'reason' requires a non-empty reward_model.reason "
+                    f"string for sample index {i}."
+                )
+
+            privileged_texts.append(reason)
+
+        return privileged_texts
+
     def _attach_opsd_teacher_privileged_info(self, batch: DataProto) -> tuple[DataProto, dict]:
         mode = self.opsd_teacher_privileged_input_mode
         if mode == "answer":
             privileged_texts = self._build_opsd_answer_privileged_texts(batch)
-        elif mode == "answer_reason":
-            raise NotImplementedError("OPSD teacher privileged input mode 'answer_reason' is not implemented yet.")
+        elif mode == "reason":
+            privileged_texts = self._build_opsd_reason_privileged_texts(batch)
         elif mode == "cot_examples":
             raise NotImplementedError("OPSD teacher privileged input mode 'cot_examples' is not implemented yet.")
         else:
@@ -1592,7 +1754,13 @@ class RayPPOTrainer:
         if not teacher_messages:
             raise ValueError("OPSD teacher input requires a non-empty raw_prompt.")
 
-        privileged_block = f"\n\nTeacher privileged information:\nAnswer: {privileged_text}"
+        privileged_label = {"answer": "Answer", "reason": "Reason"}.get(self.opsd_teacher_privileged_input_mode)
+        if privileged_label is None:
+            raise ValueError(
+                "OPSD teacher message construction requires privileged input mode 'answer' or 'reason', "
+                f"got {self.opsd_teacher_privileged_input_mode!r}."
+            )
+        privileged_block = f"\n\nTeacher privileged information:\n{privileged_label}: {privileged_text}"
         target_idx = next(
             (idx for idx in range(len(teacher_messages) - 1, -1, -1) if teacher_messages[idx].get("role") == "user"),
             len(teacher_messages) - 1,
@@ -1624,6 +1792,28 @@ class RayPPOTrainer:
         )
         return normalize_token_ids(tokenized_prompt)
 
+    def _resolve_opsd_teacher_max_context_length(self) -> Optional[int]:
+        max_context_length = getattr(self, "opsd_teacher_max_context_length", None)
+        if max_context_length is None:
+            return None
+        if hasattr(max_context_length, "get"):
+            apply_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
+            enable_thinking = apply_kwargs.get("enable_thinking", None)
+            if enable_thinking is None:
+                raise ValueError(
+                    "OPSD teacher.max_context_length has per-mode values, but "
+                    "data.apply_chat_template_kwargs.enable_thinking is not set."
+                )
+            mode = "thinking" if bool(enable_thinking) else "no_think"
+            max_context_length = max_context_length.get(mode, None)
+            if max_context_length is None:
+                raise ValueError(f"OPSD teacher.max_context_length is missing mode {mode!r}.")
+
+        max_context_length = int(max_context_length)
+        if max_context_length <= 0:
+            raise ValueError("OPSD teacher.max_context_length must be greater than 0.")
+        return max_context_length
+
     def _build_opsd_teacher_batch(self, batch: DataProto) -> tuple[DataProto, dict]:
         raw_prompts = batch.non_tensor_batch.get("raw_prompt")
         privileged_texts = batch.non_tensor_batch.get("opsd_teacher_privileged_text")
@@ -1632,21 +1822,49 @@ class RayPPOTrainer:
         if privileged_texts is None:
             raise KeyError("OPSD teacher input requires batch.non_tensor_batch['opsd_teacher_privileged_text'].")
 
-        responses = batch.batch["responses"].clone()
-        response_mask = batch.batch["response_mask"].clone()
+        responses = batch.batch["responses"]
+        response_mask = batch.batch["response_mask"]
         response_width = responses.size(1)
-        response_attention_mask = batch.batch["attention_mask"][:, -response_width:].clone()
+        response_attention_mask = batch.batch["attention_mask"][:, -response_width:]
         if response_mask.shape != responses.shape:
             raise ValueError(f"response_mask shape {response_mask.shape} must match responses shape {responses.shape}.")
         if response_attention_mask.shape != responses.shape:
             raise ValueError(
-                f"response attention mask shape {response_attention_mask.shape} must match responses shape {responses.shape}."
+                f"response attention mask shape {response_attention_mask.shape} "
+                f"must match responses shape {responses.shape}."
             )
 
         teacher_prompt_ids = []
         for raw_prompt, privileged_text in zip(raw_prompts, privileged_texts, strict=True):
             teacher_messages = self._build_opsd_teacher_messages(raw_prompt, str(privileged_text))
             teacher_prompt_ids.append(self._tokenize_opsd_teacher_prompt(teacher_messages))
+
+        max_prompt_length = getattr(self, "opsd_teacher_max_prompt_length", 12288)
+        prompt_violations = [
+            (i, len(prompt_ids))
+            for i, prompt_ids in enumerate(teacher_prompt_ids)
+            if len(prompt_ids) > max_prompt_length
+        ]
+        if prompt_violations:
+            raise ValueError(
+                "OPSD tokenized teacher prompt exceeds teacher.max_prompt_length. "
+                f"max_prompt_length={max_prompt_length}, offending_samples={prompt_violations[:8]}."
+            )
+
+        response_lens = response_attention_mask.sum(dim=-1).to(torch.long)
+        max_context_length = self._resolve_opsd_teacher_max_context_length()
+        if max_context_length is not None:
+            context_violations = [
+                (i, len(prompt_ids), int(response_lens[i].item()))
+                for i, prompt_ids in enumerate(teacher_prompt_ids)
+                if len(prompt_ids) + int(response_lens[i].item()) > max_context_length
+            ]
+            if context_violations:
+                raise ValueError(
+                    "OPSD teacher input exceeds the configured context length before tensor construction. "
+                    f"max_context_length={max_context_length}, "
+                    f"offending_samples(prompt_len,response_len)={context_violations[:8]}."
+                )
 
         device = responses.device
         dtype = responses.dtype
@@ -1676,81 +1894,179 @@ class RayPPOTrainer:
         teacher_attention_mask = torch.cat([teacher_prompt_attention_mask, response_attention_mask], dim=1)
         teacher_input_ids = torch.cat([teacher_prompts, responses], dim=1)
         teacher_position_ids = compute_position_id_with_mask(teacher_attention_mask)
+        if not torch.equal(teacher_input_ids[:, -response_width:], responses):
+            raise ValueError("OPSD teacher input must end with the unchanged student rollout responses.")
 
         teacher_data = {
-            "prompts": teacher_prompts,
-            "responses": responses,
             "input_ids": teacher_input_ids,
             "attention_mask": teacher_attention_mask,
             "position_ids": teacher_position_ids,
-            # response_mask 只控制 response token 上的 OPSD target/loss，不控制 teacher 可见上下文。
-            "response_mask": response_mask,
         }
         teacher_meta_info = dict(batch.meta_info)
         teacher_meta_info["global_token_num"] = torch.sum(teacher_attention_mask, dim=-1).tolist()
         teacher_batch = DataProto.from_single_dict(teacher_data, meta_info=teacher_meta_info)
 
         teacher_prompt_lens = torch.tensor([len(prompt_ids) for prompt_ids in teacher_prompt_ids], dtype=torch.float32)
-        response_lens = response_attention_mask.sum(dim=-1).float()
+        response_lens_float = response_lens.float()
         metrics = {
             "opsd/teacher_prompt/mean_len": teacher_prompt_lens.mean().item(),
             "opsd/teacher_prompt/max_len": teacher_prompt_lens.max().item(),
-            "opsd/teacher_response/mean_len": response_lens.mean().item(),
+            "opsd/teacher_response/mean_len": response_lens_float.mean().item(),
+            "opsd/teacher_total/max_len": (teacher_prompt_lens + response_lens_float).max().item(),
         }
         return teacher_batch, metrics
 
     def _prepare_opsd_teacher_inputs(self, batch: DataProto):
         # OPSD worker 内部会消费这些 teacher_* 张量；这里不在 RayTrainer 里算 teacher logits。
-        student_input_ids_before = batch.batch["input_ids"].clone() if self._opsd_test_is_enabled_for_step() else None
-        student_responses_before = batch.batch["responses"].clone() if self._opsd_test_is_enabled_for_step() else None
-        student_response_mask_before = (
-            batch.batch["response_mask"].clone() if self._opsd_test_is_enabled_for_step() else None
-        )
+        test_enabled = self._opsd_test_is_enabled_for_step()
+        student_input_ids_before = batch.batch["input_ids"].clone() if test_enabled else None
+        student_responses_before = batch.batch["responses"].clone() if test_enabled else None
+        expected_privileged_texts = None
+        privileged_source_field = None
+        if test_enabled:
+            if self.opsd_teacher_privileged_input_mode == "answer":
+                expected_privileged_texts = self._build_opsd_answer_privileged_texts(batch)
+                privileged_source_field = "reward_model.ground_truth"
+            elif self.opsd_teacher_privileged_input_mode == "reason":
+                expected_privileged_texts = self._build_opsd_reason_privileged_texts(batch)
+                privileged_source_field = "reward_model.reason"
+
         batch, metrics = self._attach_opsd_teacher_privileged_info(batch)
         teacher_batch, teacher_batch_metrics = self._build_opsd_teacher_batch(batch)
         metrics.update(teacher_batch_metrics)
         teacher_input_data = {
-            "opsd_teacher_prompts": teacher_batch.batch["prompts"],
-            "opsd_teacher_responses": teacher_batch.batch["responses"],
             "opsd_teacher_input_ids": teacher_batch.batch["input_ids"],
             "opsd_teacher_attention_mask": teacher_batch.batch["attention_mask"],
             "opsd_teacher_position_ids": teacher_batch.batch["position_ids"],
-            "opsd_teacher_response_mask": teacher_batch.batch["response_mask"],
         }
         batch = batch.union(DataProto.from_single_dict(teacher_input_data))
-        if self._opsd_test_is_enabled_for_step():
+        if test_enabled:
+            selected_privileged_texts = [str(text) for text in batch.non_tensor_batch["opsd_teacher_privileged_text"]]
+            selected_text_matches_source = selected_privileged_texts == expected_privileged_texts
+            raw_prompts = batch.non_tensor_batch["raw_prompt"]
+            expected_teacher_prompt_ids = [
+                self._tokenize_opsd_teacher_prompt(
+                    self._build_opsd_teacher_messages(raw_prompt, privileged_text)
+                )
+                for raw_prompt, privileged_text in zip(
+                    raw_prompts,
+                    expected_privileged_texts,
+                    strict=True,
+                )
+            ]
+            response_width = student_responses_before.size(1)
+            teacher_prompt_width = teacher_batch.batch["input_ids"].size(1) - response_width
+            actual_teacher_prompt_ids = []
+            for input_ids, attention_mask in zip(
+                teacher_batch.batch["input_ids"][:, :teacher_prompt_width],
+                teacher_batch.batch["attention_mask"][:, :teacher_prompt_width],
+                strict=True,
+            ):
+                actual_teacher_prompt_ids.append(input_ids[attention_mask.bool()].tolist())
+            teacher_prompt_matches_expected = actual_teacher_prompt_ids == expected_teacher_prompt_ids
+
+            reward_models = batch.non_tensor_batch["reward_model"]
+            uids = batch.non_tensor_batch.get("uid")
+            max_samples = int(self.opsd_test_config.get("max_samples_per_step", 2))
+            sample_evidence = []
+            for sample_index, (reward_model, selected_text, expected_ids, actual_ids) in enumerate(
+                zip(
+                    reward_models,
+                    selected_privileged_texts,
+                    expected_teacher_prompt_ids,
+                    actual_teacher_prompt_ids,
+                    strict=True,
+                )
+            ):
+                if sample_index >= max_samples:
+                    break
+                ground_truth = reward_model.get("ground_truth") if isinstance(reward_model, dict) else None
+                reason = reward_model.get("reason") if isinstance(reward_model, dict) else None
+                sample_evidence.append(
+                    {
+                        "sample_uid": None if uids is None else str(uids[sample_index]),
+                        "selected_text_sha256": self._opsd_test_text_sha256(selected_text),
+                        "selected_text_chars": len(selected_text),
+                        "ground_truth_sha256": (
+                            self._opsd_test_text_sha256(str(ground_truth)) if ground_truth is not None else None
+                        ),
+                        "reason_sha256": self._opsd_test_text_sha256(reason) if isinstance(reason, str) else None,
+                        "reason_chars": len(reason) if isinstance(reason, str) else None,
+                        "selected_differs_from_ground_truth": (
+                            selected_text != str(ground_truth) if ground_truth is not None else None
+                        ),
+                        "expected_teacher_prompt_sha256": self._opsd_test_token_ids_sha256(expected_ids),
+                        "actual_teacher_prompt_sha256": self._opsd_test_token_ids_sha256(actual_ids),
+                        "teacher_prompt_matches_expected": actual_ids == expected_ids,
+                        "teacher_prompt_tokens": len(actual_ids),
+                    }
+                )
+
+            max_context_length = self._resolve_opsd_teacher_max_context_length()
+            teacher_total_max_len = teacher_batch_metrics["opsd/teacher_total/max_len"]
             self._opsd_test_privileged_input_evidence = {
                 "num_samples": len(batch.batch),
                 "student_input_ids_unchanged": bool(
                     torch.equal(student_input_ids_before, batch.batch["input_ids"])
                 ),
                 "teacher_response_ids_match_student": bool(
-                    torch.equal(student_responses_before, teacher_batch.batch["responses"])
+                    torch.equal(
+                        student_responses_before,
+                        teacher_batch.batch["input_ids"][:, -student_responses_before.size(1) :],
+                    )
                 ),
-                "teacher_response_mask_matches_student": bool(
-                    torch.equal(student_response_mask_before, teacher_batch.batch["response_mask"])
-                ),
+                "source_field": privileged_source_field,
+                "selected_text_matches_source": selected_text_matches_source,
+                "teacher_prompt_matches_expected": teacher_prompt_matches_expected,
                 "teacher_prompt_mean_len": teacher_batch_metrics["opsd/teacher_prompt/mean_len"],
                 "teacher_prompt_max_len": teacher_batch_metrics["opsd/teacher_prompt/max_len"],
+                "teacher_total_max_len": teacher_total_max_len,
+                "teacher_prompt_within_limit": (
+                    teacher_batch_metrics["opsd/teacher_prompt/max_len"] <= self.opsd_teacher_max_prompt_length
+                ),
+                "teacher_context_within_limit": (
+                    max_context_length is None or teacher_total_max_len <= max_context_length
+                ),
+                "teacher_max_prompt_length": self.opsd_teacher_max_prompt_length,
+                "teacher_max_context_length": max_context_length,
                 "privileged_input_mode": self.opsd_teacher_privileged_input_mode,
+                "sample_evidence": sample_evidence,
             }
         return batch, metrics
 
     def _update_actor_opsd(self, batch: DataProto) -> tuple[DataProto, list[dict]]:
-        # OPSD 专用 actor 更新入口：full vocab logits 只能在 worker 的 microbatch 内部被消费。
+        # OPSD 专用 actor 更新入口：选中 response 位置的 full-vocab logits
+        # 只能在 worker 的 microbatch 内部被消费。
         required_teacher_keys = (
-            "opsd_teacher_prompts",
-            "opsd_teacher_responses",
             "opsd_teacher_input_ids",
             "opsd_teacher_attention_mask",
             "opsd_teacher_position_ids",
-            "opsd_teacher_response_mask",
         )
         missing_teacher_keys = [key for key in required_teacher_keys if key not in batch.batch.keys()]
         if missing_teacher_keys:
             raise KeyError(f"OPSD actor update requires teacher input tensors: {missing_teacher_keys}.")
 
-        batch_td = batch.to_tensordict()
+        # The teacher prompt has already been tokenized into opsd_teacher_* tensors.
+        # Do not serialize the raw answer/reason a second time to the actor worker.
+        actor_non_tensor_keys = set(batch.non_tensor_batch) - {
+            "reward_model",
+            "opsd_teacher_privileged_text",
+        }
+        actor_batch = batch.select(non_tensor_batch_keys=actor_non_tensor_keys)
+        if self._opsd_test_is_enabled_for_step():
+            self._opsd_test_actor_transport_evidence = {
+                "raw_privileged_text_absent": (
+                    "reward_model" not in actor_batch.non_tensor_batch
+                    and "opsd_teacher_privileged_text" not in actor_batch.non_tensor_batch
+                ),
+                "reason_absent": (
+                    "reason" not in actor_batch.non_tensor_batch
+                    and "reward_model" not in actor_batch.non_tensor_batch
+                ),
+                "teacher_tensor_inputs_present": all(key in actor_batch.batch for key in required_teacher_keys),
+                "num_samples": len(actor_batch),
+            }
+        batch_td = actor_batch.to_tensordict()
         batch_td = left_right_2_no_padding(batch_td)
 
         actor_config = self.config.actor_rollout_ref.actor
@@ -1970,7 +2286,19 @@ class RayPPOTrainer:
                 保留 prompt tensor 和 reward/分组所需字段，
                 去掉无关 non-tensor 字段。
                 """
+                reason_hashes_before = None
+                if self.use_opsd and self.opsd_teacher_privileged_input_mode == "reason":
+                    # Training requires reason before rollout; validation only needs ground_truth.
+                    reason_texts = self._build_opsd_reason_privileged_texts(batch)
+                    if self._opsd_test_is_enabled_for_step():
+                        reason_hashes_before = [self._opsd_test_text_sha256(reason) for reason in reason_texts]
                 gen_batch = self._get_gen_batch(batch)
+                if self.use_opsd:
+                    self._capture_opsd_test_rollout_projection(
+                        batch=batch,
+                        gen_batch=gen_batch,
+                        reason_hashes_before=reason_hashes_before,
+                    )
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
@@ -2028,7 +2356,7 @@ class RayPPOTrainer:
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    batch = self._merge_rollout_output(batch, gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -2060,13 +2388,7 @@ class RayPPOTrainer:
 
                         self._post_actor_update(timing_raw=timing_raw, is_last_step=is_last_step)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        token_loss_sum = actor_output_metrics.get("actor/opsd_token_loss_sum")
-                        response_tokens = actor_output_metrics.get("actor/opsd_response_tokens")
-                        if token_loss_sum is None or response_tokens is None:
-                            raise KeyError(
-                                "OPSD actor metrics require actor/opsd_token_loss_sum and actor/opsd_response_tokens."
-                            )
-                        actor_output_metrics["actor/opsd_token_loss_mean"] = token_loss_sum / max(response_tokens, 1)
+                        actor_output_metrics.update(finalize_opsd_actor_metrics(actor_output_metrics))
                         self._record_opsd_test_step(
                             records=opsd_test_records,
                             actor_metrics=actor_output_metrics,

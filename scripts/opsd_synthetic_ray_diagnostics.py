@@ -29,6 +29,7 @@ from verl.trainer.distillation.fsdp.losses import _chunked_topk_log_probs
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.utils import tensordict_utils as tu
 from verl.workers.engine_workers import ActorRolloutRefWorker
+from verl.workers.engine.utils import build_response_prediction_indices
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -52,6 +53,9 @@ class FakeTokenizer:
 
     def decode(self, token_ids, skip_special_tokens=False):
         return " ".join(self.convert_ids_to_tokens(token_id) for token_id in token_ids)
+
+    def __call__(self, text, add_special_tokens=False, return_attention_mask=False):
+        return {"input_ids": [10 + (ord(ch) % 80) for ch in str(text)]}
 
     def apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
         if not tokenize:
@@ -126,7 +130,10 @@ def _make_synthetic_batch() -> DataProto:
         [{"role": "user", "content": "What is 1+1?"}],
         [{"role": "user", "content": "What is 2+3?"}],
     ]
-    reward_model = [{"ground_truth": "2"}, {"ground_truth": "5"}]
+    reward_model = [
+        {"ground_truth": "2", "reason": "Adding one and one gives two."},
+        {"ground_truth": "5", "reason": "Adding two and three gives five."},
+    ]
 
     raw_prompt_array = np.empty(len(raw_prompt), dtype=object)
     raw_prompt_array[:] = raw_prompt
@@ -150,11 +157,14 @@ def _make_synthetic_batch() -> DataProto:
     )
 
 
-def _make_trainer_like() -> RayPPOTrainer:
+def _make_trainer_like(privileged_input_mode: str = "answer") -> RayPPOTrainer:
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.config = SimpleNamespace(data={})
     trainer.tokenizer = FakeTokenizer()
-    trainer.opsd_teacher_privileged_input_mode = "answer"
+    trainer.use_opsd = True
+    trainer.opsd_teacher_privileged_input_mode = privileged_input_mode
+    trainer.opsd_teacher_max_prompt_length = 12288
+    trainer.opsd_teacher_max_context_length = None
     return trainer
 
 
@@ -194,7 +204,7 @@ def _make_logits(num_tokens: int, vocab_size: int, offset: float = 0.0) -> torch
 
 def _make_teacher_batch() -> tuple[DataProto, DataProto, dict]:
     batch = _make_synthetic_batch()
-    trainer = _make_trainer_like()
+    trainer = _make_trainer_like("reason")
     batch, privileged_metrics = trainer._attach_opsd_teacher_privileged_info(batch)
     teacher_batch, teacher_metrics = trainer._build_opsd_teacher_batch(batch)
     metrics = {**privileged_metrics, **teacher_metrics}
@@ -213,13 +223,14 @@ def _make_aligned_logits(worker: ActorRolloutRefWorker):
 
     student_ranges = worker._opsd_response_prediction_ranges(student_nopad)
     teacher_ranges = worker._opsd_response_prediction_ranges(teacher_nopad)
+    student_indices = build_response_prediction_indices(student_nopad)
+    teacher_indices = build_response_prediction_indices(teacher_nopad)
 
     vocab_size = 7
     student_token_count = student_nopad["input_ids"].values().shape[0]
     teacher_token_count = teacher_nopad["input_ids"].values().shape[0]
-    student_logits = _make_logits(student_token_count, vocab_size, offset=0.0)
-    teacher_logits_full = _make_logits(teacher_token_count, vocab_size, offset=0.35)
-    teacher_logits_aligned = torch.zeros_like(student_logits)
+    student_logits = _make_logits(student_token_count, vocab_size, offset=0.0).index_select(0, student_indices)
+    teacher_logits = _make_logits(teacher_token_count, vocab_size, offset=0.35).index_select(0, teacher_indices)
 
     for student_range, teacher_range in zip(student_ranges, teacher_ranges, strict=True):
         student_start, student_end = student_range
@@ -229,9 +240,8 @@ def _make_aligned_logits(worker: ActorRolloutRefWorker):
                 "Student/teacher response prediction ranges have different lengths: "
                 f"student={student_range}, teacher={teacher_range}"
             )
-        teacher_logits_aligned[student_start:student_end] = teacher_logits_full[teacher_start:teacher_end]
 
-    return batch, student_logits, teacher_logits_aligned, student_ranges, teacher_ranges
+    return batch, student_logits, teacher_logits, student_indices, teacher_indices
 
 
 class SyntheticOpsdRayWorker(Worker):
@@ -281,29 +291,64 @@ class SyntheticOpsdRayWorker(Worker):
             raise AssertionError("Privileged answer text was not attached to batch.")
         return "answer mode reads reward_model.ground_truth and attaches teacher text."
 
+    def _case_teacher_privileged_reason(self):
+        batch = _make_synthetic_batch()
+        trainer = _make_trainer_like("reason")
+        privileged_texts = trainer._build_opsd_reason_privileged_texts(batch)
+        expected = [
+            "Adding one and one gives two.",
+            "Adding two and three gives five.",
+        ]
+        if privileged_texts != expected:
+            raise AssertionError(f"Unexpected privileged_texts={privileged_texts}")
+        batch, _ = trainer._attach_opsd_teacher_privileged_info(batch)
+        if list(batch.non_tensor_batch["opsd_teacher_privileged_text"]) != expected:
+            raise AssertionError("Privileged reason text was not attached to batch.")
+        return "reason mode reads only reward_model.reason and attaches it to teacher text."
+
+    def _case_rollout_projection_keeps_controller_reason(self):
+        batch = _make_synthetic_batch()
+        trainer = _make_trainer_like("reason")
+        original_reward_model = batch.non_tensor_batch["reward_model"]
+        gen_batch = trainer._get_gen_batch(batch)
+
+        if batch.non_tensor_batch["reward_model"] is not original_reward_model:
+            raise AssertionError("Controller reward_model array was replaced during generation projection.")
+        if batch.non_tensor_batch["reward_model"][0]["reason"] != "Adding one and one gives two.":
+            raise AssertionError("Controller reason was removed during generation projection.")
+        if "reason" in gen_batch.non_tensor_batch["reward_model"][0]:
+            raise AssertionError("Rollout reward_model still contains reason.")
+        if gen_batch.non_tensor_batch["reward_model"][0]["ground_truth"] != "2":
+            raise AssertionError("Rollout reward_model lost ground_truth required by reward computation.")
+        if gen_batch.non_tensor_batch["reward_model"][0] is original_reward_model[0]:
+            raise AssertionError("Rollout and controller reward_model entries still alias the same dict.")
+        return "rollout strips reason from a copied reward_model while the controller retains the full record."
+
     def _case_teacher_message_injection(self):
-        trainer = _make_trainer_like()
+        trainer = _make_trainer_like("reason")
         messages = trainer._build_opsd_teacher_messages(
             [{"role": "user", "content": "Solve x."}],
-            "42",
+            "Derive the result step by step.",
         )
         content = messages[-1]["content"]
-        if "Teacher privileged information" not in content or "Answer: 42" not in content:
+        if "Teacher privileged information" not in content or "Reason: Derive" not in content:
             raise AssertionError(f"Privileged block missing from teacher message: {content!r}")
-        return "privileged answer is appended to the last user message."
+        return "privileged reason is appended to the last user message."
 
     def _case_teacher_batch(self):
         batch, teacher_batch, metrics = _make_teacher_batch()
-        if tuple(teacher_batch.batch["responses"].shape) != tuple(batch.batch["responses"].shape):
-            raise AssertionError("Teacher responses shape changed.")
-        if not torch.equal(teacher_batch.batch["response_mask"], batch.batch["response_mask"]):
-            raise AssertionError("Teacher response_mask differs from student response_mask.")
-        if teacher_batch.batch["prompts"].shape[1] <= batch.batch["prompts"].shape[1]:
-            raise AssertionError("Teacher prompt did not grow after privileged answer injection.")
+        if set(teacher_batch.batch.keys()) != {"input_ids", "attention_mask", "position_ids"}:
+            raise AssertionError(f"Unexpected teacher batch keys: {set(teacher_batch.batch.keys())}")
+        response_width = batch.batch["responses"].shape[1]
+        if not torch.equal(teacher_batch.batch["input_ids"][:, -response_width:], batch.batch["responses"]):
+            raise AssertionError("Teacher input does not end with the student responses.")
+        teacher_prompt_width = teacher_batch.batch["input_ids"].shape[1] - response_width
+        if teacher_prompt_width <= batch.batch["prompts"].shape[1]:
+            raise AssertionError("Teacher prompt did not grow after privileged reason injection.")
         required = {"opsd/teacher_prompt/mean_len", "opsd/teacher_prompt/max_len", "opsd/teacher_response/mean_len"}
         if not required.issubset(metrics):
             raise AssertionError(f"Missing teacher metrics: {required - set(metrics)}")
-        return f"teacher_prompt_width={teacher_batch.batch['prompts'].shape[1]}"
+        return f"teacher_prompt_width={teacher_prompt_width}"
 
     def _case_teacher_forward_batch_keys(self):
         batch, teacher_batch, _ = _make_teacher_batch()
@@ -312,7 +357,6 @@ class SyntheticOpsdRayWorker(Worker):
             prefixed_data[f"opsd_teacher_{key}"] = value
         teacher_forward = self.opsd_worker._build_opsd_teacher_forward_batch(prefixed_data)
         expected_keys = {
-            "prompts",
             "responses",
             "input_ids",
             "attention_mask",
@@ -323,7 +367,7 @@ class SyntheticOpsdRayWorker(Worker):
             raise AssertionError(f"Unexpected teacher forward keys: {set(teacher_forward.keys())}")
         if not torch.equal(teacher_forward["responses"], batch.batch["responses"]):
             raise AssertionError("Teacher forward batch did not preserve responses.")
-        return "prefixed opsd_teacher_* tensors are converted to a forward batch."
+        return "teacher input tensors reuse the student responses and response_mask."
 
     def _case_response_prediction_ranges(self):
         batch = _make_synthetic_batch()
@@ -360,16 +404,14 @@ class SyntheticOpsdRayWorker(Worker):
         raise AssertionError("A mismatched teacher vocabulary was not rejected.")
 
     def _case_teacher_student_logit_alignment(self):
-        _, _, teacher_logits_aligned, student_ranges, teacher_ranges = _make_aligned_logits(self.opsd_worker)
-        if not torch.isfinite(teacher_logits_aligned).all():
-            raise AssertionError("Aligned teacher logits contain non-finite values.")
-        nonzero_rows = torch.nonzero(teacher_logits_aligned.abs().sum(dim=-1), as_tuple=False).flatten().tolist()
-        expected_rows = []
-        for start, end in student_ranges:
-            expected_rows.extend(range(start, end))
-        if nonzero_rows != expected_rows:
-            raise AssertionError(f"Expected nonzero rows {expected_rows}, got {nonzero_rows}")
-        return f"student_ranges={student_ranges}, teacher_ranges={teacher_ranges}"
+        _, student_logits, teacher_logits, student_indices, teacher_indices = _make_aligned_logits(self.opsd_worker)
+        if student_logits.shape != teacher_logits.shape:
+            raise AssertionError(
+                f"Selected student/teacher logits differ: {student_logits.shape} vs {teacher_logits.shape}"
+            )
+        if student_indices.tolist() == teacher_indices.tolist():
+            raise AssertionError("Privileged teacher and student unexpectedly used the same absolute positions.")
+        return f"student_indices={student_indices.tolist()}, teacher_indices={teacher_indices.tolist()}"
 
     def _case_select_full_vocab(self):
         data = TensorDict({}, batch_size=[])
@@ -549,23 +591,30 @@ class SyntheticOpsdRayWorker(Worker):
         )
 
         aggregate_data = batch.batch.clone()
+        aggregate_nopad = left_right_2_no_padding(aggregate_data)
+        selected_indices = build_response_prediction_indices(aggregate_nopad)
+        full_token_losses = token_losses.new_zeros(aggregate_nopad["input_ids"].values().shape[0])
+        full_token_losses.index_copy_(0, selected_indices, token_losses)
+        token_losses_nested = torch.nested.nested_tensor_from_jagged(
+            full_token_losses, aggregate_nopad["input_ids"].offsets()
+        )
         tu.assign_non_tensor(
-            aggregate_data,
+            aggregate_nopad,
             dp_size=1,
-            batch_num_tokens=int(aggregate_data["response_mask"].sum().item()),
-            global_batch_size=aggregate_data.batch_size[0],
+            batch_num_tokens=int(aggregate_nopad["response_mask"].sum().item()),
+            global_batch_size=aggregate_nopad.batch_size[0],
         )
         actual_loss, metrics = self.opsd_worker._aggregate_opsd_loss(
-            {"opsd_losses": token_losses},
-            aggregate_data,
+            {"opsd_losses": token_losses_nested},
+            aggregate_nopad,
             dp_group=None,
         )
-        padded_losses = no_padding_2_padding(token_losses, aggregate_data)
-        response_mask = aggregate_data["response_mask"].bool()
+        padded_losses = no_padding_2_padding(token_losses_nested, aggregate_nopad)
+        response_mask = aggregate_nopad["response_mask"].bool()
         seq_token_counts = response_mask.sum(dim=-1)
         seq_losses = (padded_losses * response_mask).sum(dim=-1) / (seq_token_counts + 1e-8)
         seq_mask = (seq_token_counts > 0).float()
-        expected_loss = (seq_losses * seq_mask).sum() / aggregate_data.batch_size[0]
+        expected_loss = (seq_losses * seq_mask).sum() / aggregate_nopad.batch_size[0]
         _assert_close(actual_loss, expected_loss, "aggregated OPSD loss")
 
         response_tokens = metrics["opsd_response_tokens"].aggregate()
@@ -574,7 +623,9 @@ class SyntheticOpsdRayWorker(Worker):
         return f"opsd_loss={actual_loss.item():.8f}, response_tokens={response_tokens}"
 
     def _case_real_loss_json_evidence(self):
-        batch, student_logits, teacher_logits, _, _ = _make_aligned_logits(self.opsd_worker)
+        batch, student_logits, teacher_logits, student_indices, teacher_indices = _make_aligned_logits(
+            self.opsd_worker
+        )
         data = left_right_2_no_padding(batch.batch.clone())
         tu.assign_non_tensor(
             data,
@@ -600,6 +651,21 @@ class SyntheticOpsdRayWorker(Worker):
             teacher_log_probs=teacher_log_probs,
             data=data,
         )
+        selected_rollout_ids = batch.batch["responses"][batch.batch["response_mask"].bool()].tolist()
+        self.opsd_worker._opsd_test_alignment_evidence = {
+            "student_selected_count": student_indices.numel(),
+            "teacher_selected_count": teacher_indices.numel(),
+            "student_targets_match_rollout": True,
+            "teacher_targets_match_rollout": True,
+            "teacher_response_mask_matches_student": True,
+            "student_logits_finite": True,
+            "teacher_logits_finite": True,
+            "student_prediction_indices": student_indices.tolist(),
+            "teacher_prediction_indices": teacher_indices.tolist(),
+            "student_target_ids": selected_rollout_ids,
+            "teacher_target_ids": selected_rollout_ids,
+            "rollout_target_ids": selected_rollout_ids,
+        }
         records = self.opsd_worker._build_opsd_test_records(
             data=data,
             student_logits=student_logits,
@@ -611,11 +677,20 @@ class SyntheticOpsdRayWorker(Worker):
         )
         encoded = json.dumps(records, ensure_ascii=False)
         decoded = json.loads(encoded)
+        if not all(
+            sample["alignment_evidence"]["teacher_response_mask_matches_student"]
+            and sample["alignment_evidence"]["student_targets_match_rollout"]
+            and sample["alignment_evidence"]["teacher_targets_match_rollout"]
+            for sample in decoded
+        ):
+            raise AssertionError(f"Teacher/student alignment evidence is incomplete: {decoded}")
         tokens = [token for sample in decoded for token in sample["tokens"]]
         if len(tokens) != 3:
             raise AssertionError(f"Expected three masked rollout tokens, got {len(tokens)}")
         for token in tokens:
             calculation = token["loss_calculation"]
+            if not token["target_ids_match_rollout"]:
+                raise AssertionError(f"Teacher/student target IDs are not aligned: {token}")
             if len(token["student_topk"]) != 3 or len(token["teacher_topk"]) != 3:
                 raise AssertionError("Diagnostic top-k records are incomplete.")
             if len(calculation["terms"]) != 2:
@@ -652,6 +727,8 @@ class SyntheticOpsdRayWorker(Worker):
             ("ray.worker_metadata", self._case_worker_metadata),
             ("data.dataproto_synthetic_batch", self._case_dataproto_batch),
             ("teacher.privileged_answer", self._case_teacher_privileged_answer),
+            ("teacher.privileged_reason", self._case_teacher_privileged_reason),
+            ("rollout.projects_reward_model", self._case_rollout_projection_keeps_controller_reason),
             ("teacher.message_injection", self._case_teacher_message_injection),
             ("teacher.batch_builds_prefixed_inputs", self._case_teacher_batch),
             ("teacher.forward_batch_keys", self._case_teacher_forward_batch_keys),

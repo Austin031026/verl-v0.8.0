@@ -14,11 +14,14 @@
 
 import unittest
 from dataclasses import dataclass, field
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from omegaconf import OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils import omega_conf_to_dataclass
+from verl.utils.config import validate_config
 
 
 @dataclass
@@ -91,6 +94,60 @@ class TestPrintCfgCommand(unittest.TestCase):
         # Verify the output contains expected config information
         self.assertIn("critic", result.stdout)
         self.assertIn("profiler", result.stdout)
+
+
+class TestOPSDConfigValidation(unittest.TestCase):
+    def test_opsd_rejects_legacy_rollout_dump(self):
+        config = OmegaConf.create(
+            {
+                "trainer": {"n_gpus_per_node": 1, "nnodes": 1, "rollout_data_dir": "/tmp/rollouts"},
+                "actor_rollout_ref": {
+                    "actor": {"use_dynamic_bsz": True},
+                    "rollout": {"n": 1, "skip": {"enable": False}},
+                    "model": {},
+                },
+                "data": {"train_batch_size": 1},
+                "opsd": {"enabled": True, "test": {"enabled": False}},
+            }
+        )
+        actor_config = SimpleNamespace(
+            ppo_mini_batch_size=1,
+            ppo_epochs=1,
+            shuffle=False,
+            ulysses_sequence_parallel_size=1,
+            fsdp_config=SimpleNamespace(ulysses_sequence_parallel_size=1),
+            validate=lambda *args: None,
+        )
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=actor_config):
+            with self.assertRaisesRegex(ValueError, "trainer.rollout_data_dir"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_opsd_rejects_rollout_skip(self):
+        config = OmegaConf.create(
+            {
+                "trainer": {"n_gpus_per_node": 1, "nnodes": 1},
+                "actor_rollout_ref": {
+                    "actor": {"use_dynamic_bsz": True},
+                    "rollout": {"n": 1, "skip": {"enable": True}},
+                    "model": {},
+                },
+                "data": {"train_batch_size": 1},
+                "opsd": {"enabled": True, "test": {"enabled": False}},
+            }
+        )
+        actor_config = SimpleNamespace(
+            ppo_mini_batch_size=1,
+            ppo_epochs=1,
+            shuffle=False,
+            ulysses_sequence_parallel_size=1,
+            fsdp_config=SimpleNamespace(ulysses_sequence_parallel_size=1),
+            validate=lambda *args: None,
+        )
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=actor_config):
+            with self.assertRaisesRegex(ValueError, "rollout skip/cache"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
 
 
 if __name__ == "__main__":

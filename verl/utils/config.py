@@ -174,6 +174,18 @@ def validate_config(
         if not opsd_test_config.get("output_path", None):
             raise ValueError("opsd.test.output_path must be set when OPSD test mode is enabled.")
     if opsd_enabled:
+        rollout_data_dir = config.trainer.get("rollout_data_dir", None)
+        if rollout_data_dir:
+            raise ValueError(
+                "OPSD does not support trainer.rollout_data_dir because the legacy rollout dump requires "
+                "RL token_level_scores. Disable trainer.rollout_data_dir and use the OPSD training metrics log."
+            )
+        rollout_skip_config = config.actor_rollout_ref.rollout.get("skip", {})
+        if bool(rollout_skip_config.get("enable", False)):
+            raise ValueError(
+                "Strict OPSD requires fresh on-policy rollouts and does not support "
+                "actor_rollout_ref.rollout.skip.enable=True. Disable rollout skip/cache."
+            )
         if config.data.train_batch_size != actor_config.ppo_mini_batch_size:
             raise ValueError(
                 "Strict OPSD requires one actor update per rollout batch, so "
