@@ -152,6 +152,13 @@ def validate_config(
 
     opsd_config = config.get("opsd", None)
     opsd_enabled = bool(opsd_config is not None and opsd_config.get("enabled", False))
+    opsd_rl_coupling = opsd_config.get("loss", {}).get("rl_coupling", "none") if opsd_enabled else "none"
+    pure_opsd = opsd_enabled and opsd_rl_coupling == "none"
+    if opsd_enabled and opsd_rl_coupling != "none":
+        raise NotImplementedError(
+            f"OPSD rl_coupling={opsd_rl_coupling!r} is not implemented. Use "
+            "opsd.loss.rl_coupling=none for pure OPSD training."
+        )
     opsd_test_config = opsd_config.get("test", {}) if opsd_config is not None else {}
     opsd_test_enabled = bool(opsd_test_config.get("enabled", False))
     if opsd_test_enabled and not opsd_enabled:
@@ -186,6 +193,44 @@ def validate_config(
                 "Strict OPSD requires fresh on-policy rollouts and does not support "
                 "actor_rollout_ref.rollout.skip.enable=True. Disable rollout skip/cache."
             )
+        if pure_opsd:
+            if bool(config.trainer.get("val_before_train", True)):
+                raise ValueError(
+                    "Pure OPSD training does not run reward-based validation. Set "
+                    "trainer.val_before_train=False and validate saved Student checkpoints with "
+                    "examples/evaluation/run_checkpoint_benchmark.sh."
+                )
+            if int(config.trainer.get("test_freq", -1)) != -1:
+                raise ValueError(
+                    "Pure OPSD training does not run periodic reward-based validation. Set "
+                    "trainer.test_freq=-1 and validate saved Student checkpoints with "
+                    "examples/evaluation/run_checkpoint_benchmark.sh."
+                )
+            if bool(config.trainer.get("val_only", False)):
+                raise ValueError(
+                    "Pure OPSD is a training-only route and does not support trainer.val_only=True. "
+                    "Use examples/evaluation/run_checkpoint_benchmark.sh for checkpoint validation."
+                )
+
+            reward_config = config.get("reward", {})
+            reward_model_config = reward_config.get("reward_model", {})
+            if bool(reward_model_config.get("enable", False)):
+                raise ValueError(
+                    "Pure OPSD training does not create a RewardLoop or Reward Model. Set "
+                    "reward.reward_model.enable=False."
+                )
+            if bool(reward_model_config.get("enable_resource_pool", False)):
+                raise ValueError(
+                    "Pure OPSD training does not allocate Reward Model resources. Set "
+                    "reward.reward_model.enable_resource_pool=False."
+                )
+            custom_reward_config = reward_config.get("custom_reward_function", {})
+            if custom_reward_config and custom_reward_config.get("path", None):
+                raise ValueError(
+                    "Pure OPSD training does not call a custom reward function. Remove "
+                    "reward.custom_reward_function.path and use a real scorer only in the standalone "
+                    "checkpoint benchmark."
+                )
         if config.data.train_batch_size != actor_config.ppo_mini_batch_size:
             raise ValueError(
                 "Strict OPSD requires one actor update per rollout batch, so "

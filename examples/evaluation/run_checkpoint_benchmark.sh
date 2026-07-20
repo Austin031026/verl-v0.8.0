@@ -17,6 +17,7 @@ RESULTS_ROOT=${RESULTS_ROOT:-$FENG_J/benchmark_results}
 
 EXPECTED_PROMPTS=${EXPECTED_PROMPTS:-30}
 VAL_N=${VAL_N:-32}
+VAL_BATCH_SIZE=${VAL_BATCH_SIZE:-null}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-2048}
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH + 1))}
@@ -34,6 +35,7 @@ AGENT_NUM_WORKERS=${AGENT_NUM_WORKERS:-32}
 VAL_TEMPERATURE=${VAL_TEMPERATURE:-1.0}
 VAL_TOP_P=${VAL_TOP_P:-0.7}
 VAL_TOP_K=${VAL_TOP_K:--1}
+VAL_DO_SAMPLE=${VAL_DO_SAMPLE:-True}
 EVAL_ID=${EVAL_ID:-$(date +%Y%m%d_%H%M%S)}
 CUSTOM_REWARD_FUNCTION_PATH=${CUSTOM_REWARD_FUNCTION_PATH:-}
 CUSTOM_REWARD_FUNCTION_NAME=${CUSTOM_REWARD_FUNCTION_NAME:-compute_score}
@@ -92,6 +94,7 @@ config = {
     "model_manifest": "$MODEL_MANIFEST",
     "expected_prompts": $EXPECTED_PROMPTS,
     "val_n": $VAL_N,
+    "val_batch_size": $VAL_BATCH_SIZE,
     "max_prompt_length": $MAX_PROMPT_LENGTH,
     "max_response_length": $MAX_RESPONSE_LENGTH,
     "max_model_len": $MAX_MODEL_LEN,
@@ -107,6 +110,7 @@ config = {
     "temperature": $VAL_TEMPERATURE,
     "top_p": $VAL_TOP_P,
     "top_k": $VAL_TOP_K,
+    "do_sample": "$VAL_DO_SAMPLE",
     "custom_reward_function_path": "$CUSTOM_REWARD_FUNCTION_PATH",
     "custom_reward_function_name": "$CUSTOM_REWARD_FUNCTION_NAME",
 }
@@ -206,7 +210,7 @@ while IFS=$'\t' read -r label backend source_path extra; do
         data.train_files="$BENCHMARK_FILE" \
         data.val_files="$BENCHMARK_FILE" \
         data.train_batch_size=1 \
-        data.val_batch_size=null \
+        data.val_batch_size="$VAL_BATCH_SIZE" \
         data.max_prompt_length="$MAX_PROMPT_LENGTH" \
         data.max_response_length="$MAX_RESPONSE_LENGTH" \
         data.filter_overlong_prompts=False \
@@ -236,7 +240,7 @@ while IFS=$'\t' read -r label backend source_path extra; do
         actor_rollout_ref.rollout.enforce_eager=False \
         actor_rollout_ref.rollout.ignore_eos=False \
         actor_rollout_ref.rollout.agent.num_workers="$AGENT_NUM_WORKERS" \
-        actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+        actor_rollout_ref.rollout.val_kwargs.do_sample="$VAL_DO_SAMPLE" \
         actor_rollout_ref.rollout.val_kwargs.n="$VAL_N" \
         actor_rollout_ref.rollout.val_kwargs.temperature="$VAL_TEMPERATURE" \
         actor_rollout_ref.rollout.val_kwargs.top_p="$VAL_TOP_P" \

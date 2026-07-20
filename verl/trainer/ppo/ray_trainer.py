@@ -358,6 +358,8 @@ class RayPPOTrainer:
             if self.use_opsd
             else "none"
         )
+        self.pure_opsd = self.use_opsd and self.opsd_rl_coupling == "none"
+        self.reward_loop_manager = None
         self.opsd_teacher_privileged_input_mode = (
             self.opsd_config.get("teacher", {}).get("privileged_input", {}).get("mode", "answer")
             if self.use_opsd
@@ -606,8 +608,8 @@ class RayPPOTrainer:
                 )
 
         reason_absent_from_rollout_reward_model = bool(
-            rollout_reward_models is not None
-            and all(
+            rollout_reward_models is None
+            or all(
                 isinstance(reward_model, dict) and "reason" not in reward_model
                 for reward_model in rollout_reward_models
             )
@@ -918,6 +920,11 @@ class RayPPOTrainer:
             )
             gen_batch.non_tensor_batch.pop("reason", None)
 
+            if self.pure_opsd:
+                gen_batch.non_tensor_batch.pop("reward_model", None)
+                gen_batch.non_tensor_batch.pop("data_source", None)
+                return gen_batch
+
             reward_models = batch.non_tensor_batch.get("reward_model")
             if reward_models is not None:
                 rollout_reward_models = np.empty(reward_models.shape, dtype=object)
@@ -1138,6 +1145,20 @@ class RayPPOTrainer:
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _init_reward_loop_manager(self) -> None:
+        """Create reward workers only for training modes that consume reward."""
+        if self.pure_opsd:
+            self.reward_loop_manager = None
+            return
+
+        from verl.experimental.reward_loop import RewardLoopManager
+
+        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
+        self.reward_loop_manager = RewardLoopManager(
+            config=self.config,
+            rm_resource_pool=resource_pool,
+        )
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -1280,17 +1301,7 @@ class RayPPOTrainer:
         if self.ref_in_actor:
             self.ref_policy_wg = self.actor_rollout_wg
 
-        # create reward loop manager
-        from verl.experimental.reward_loop import RewardLoopManager
-
-        # initalize reward loop manager
-        # reward model (colocate or standalone): get resource_pool
-        # no reward model: resource_pool = None
-        resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel) if self.use_rm else None
-        self.reward_loop_manager = RewardLoopManager(
-            config=self.config,
-            rm_resource_pool=resource_pool,
-        )
+        self._init_reward_loop_manager()
 
         # create async rollout manager and request scheduler
         # Note: mode is always "async" since sync mode is deprecated
@@ -1329,7 +1340,9 @@ class RayPPOTrainer:
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        enable_agent_reward_loop = self.reward_loop_manager is not None and (
+            not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        )
         """
         student actor/rollout worker group 包装成可请求的 rollout 推理服务，
         并创建负载均衡 client，供后面的 AgentLoopManager 生成训练样本用。"""

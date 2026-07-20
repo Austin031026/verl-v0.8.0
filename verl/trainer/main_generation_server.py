@@ -121,7 +121,15 @@ async def generate(
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
-    ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}})
+    ray_init_kwargs = {
+        "runtime_env": {
+            "env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_USE_V1": "1"}
+        }
+    }
+    ray_tmpdir = os.environ.get("RAY_TMPDIR")
+    if ray_tmpdir:
+        ray_init_kwargs["_temp_dir"] = ray_tmpdir
+    ray.init(**ray_init_kwargs)
 
     pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
     OmegaConf.resolve(config)
@@ -135,9 +143,12 @@ def main(config):
     sampling_params = {
         "temperature": config.actor_rollout_ref.rollout.temperature,
         "top_p": config.actor_rollout_ref.rollout.top_p,
-        # "top_k": config.actor_rollout_ref.rollout.top_k,
+        "top_k": config.actor_rollout_ref.rollout.top_k,
         "max_tokens": config.actor_rollout_ref.rollout.response_length,
     }
+    chat_template_kwargs = config.data.get("apply_chat_template_kwargs", None)
+    if chat_template_kwargs:
+        sampling_params["chat_template_kwargs"] = OmegaConf.to_container(chat_template_kwargs, resolve=True)
 
     from omegaconf import ListConfig
 
@@ -155,21 +166,31 @@ def main(config):
     # concat dataset
     dataset = pd.concat(datasets, axis=0, ignore_index=True)
     chat_lst = dataset[config.data.prompt_key].tolist()
-    chat_lst = [chat.tolist() for chat in chat_lst]
+    chat_lst = [chat.tolist() if hasattr(chat, "tolist") else chat for chat in chat_lst]
     chat_numpy = np.array(chat_lst)
 
     # start native server
     server_handles, server_addresses = asyncio.run(start_server(config))
 
-    # run generate
-    gen_results = asyncio.run(
-        generate(server_addresses, config.actor_rollout_ref.model.path, n_samples, sampling_params, chat_numpy)
-    )
-
-    # reshape results into a numpy array
     import itertools
 
-    results = list(itertools.chain.from_iterable(gen_results))
+    generation_batch_size = int(config.data.get("generation_batch_size", len(chat_numpy)))
+    assert generation_batch_size >= 1, "data.generation_batch_size must be at least 1"
+
+    results = []
+    for start in range(0, len(chat_numpy), generation_batch_size):
+        end = min(start + generation_batch_size, len(chat_numpy))
+        print(f"Generating prompts [{start}:{end}) of {len(chat_numpy)}")
+        gen_results = asyncio.run(
+            generate(
+                server_addresses,
+                config.actor_rollout_ref.model.path,
+                n_samples,
+                sampling_params,
+                chat_numpy[start:end],
+            )
+        )
+        results.extend(itertools.chain.from_iterable(gen_results))
 
     # extract content from results
     results = np.array([result.choices[0].message.content for result in results])

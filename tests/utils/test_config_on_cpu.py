@@ -97,6 +97,45 @@ class TestPrintCfgCommand(unittest.TestCase):
 
 
 class TestOPSDConfigValidation(unittest.TestCase):
+    @staticmethod
+    def _make_pure_opsd_config(*, trainer_overrides=None, reward_overrides=None):
+        trainer = {"n_gpus_per_node": 1, "nnodes": 1, "val_before_train": False, "test_freq": -1}
+        trainer.update(trainer_overrides or {})
+        reward = {
+            "reward_model": {"enable": False, "enable_resource_pool": False},
+            "custom_reward_function": {"path": None},
+        }
+        if reward_overrides:
+            reward.update(reward_overrides)
+        return OmegaConf.create(
+            {
+                "trainer": trainer,
+                "actor_rollout_ref": {
+                    "actor": {"use_dynamic_bsz": True},
+                    "rollout": {"n": 1, "skip": {"enable": False}},
+                    "model": {},
+                },
+                "data": {"train_batch_size": 1},
+                "reward": reward,
+                "opsd": {
+                    "enabled": True,
+                    "loss": {"rl_coupling": "none"},
+                    "test": {"enabled": False},
+                },
+            }
+        )
+
+    @staticmethod
+    def _actor_config():
+        return SimpleNamespace(
+            ppo_mini_batch_size=1,
+            ppo_epochs=1,
+            shuffle=False,
+            ulysses_sequence_parallel_size=1,
+            fsdp_config=SimpleNamespace(ulysses_sequence_parallel_size=1),
+            validate=lambda *args: None,
+        )
+
     def test_opsd_rejects_legacy_rollout_dump(self):
         config = OmegaConf.create(
             {
@@ -147,6 +186,53 @@ class TestOPSDConfigValidation(unittest.TestCase):
 
         with patch("verl.utils.config.omega_conf_to_dataclass", return_value=actor_config):
             with self.assertRaisesRegex(ValueError, "rollout skip/cache"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_pure_opsd_rejects_validation_before_training(self):
+        config = self._make_pure_opsd_config(trainer_overrides={"val_before_train": True})
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(ValueError, "trainer.val_before_train=False"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_pure_opsd_rejects_periodic_validation(self):
+        config = self._make_pure_opsd_config(trainer_overrides={"test_freq": 10})
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(ValueError, "trainer.test_freq=-1"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_pure_opsd_rejects_reward_model(self):
+        config = self._make_pure_opsd_config(reward_overrides={"reward_model": {"enable": True}})
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(ValueError, "reward.reward_model.enable=False"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_pure_opsd_rejects_reward_model_resource_pool(self):
+        config = self._make_pure_opsd_config(
+            reward_overrides={"reward_model": {"enable": False, "enable_resource_pool": True}}
+        )
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(ValueError, "reward.reward_model.enable_resource_pool=False"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_pure_opsd_rejects_custom_reward_function(self):
+        config = self._make_pure_opsd_config(
+            reward_overrides={"custom_reward_function": {"path": "/tmp/fake_reward.py"}}
+        )
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(ValueError, "reward.custom_reward_function.path"):
+                validate_config(config, use_reference_policy=False, use_critic=False)
+
+    def test_opsd_rejects_unimplemented_rl_coupling_before_worker_startup(self):
+        config = self._make_pure_opsd_config()
+        config.opsd.loss.rl_coupling = "grpo"
+
+        with patch("verl.utils.config.omega_conf_to_dataclass", return_value=self._actor_config()):
+            with self.assertRaisesRegex(NotImplementedError, "rl_coupling='grpo'"):
                 validate_config(config, use_reference_policy=False, use_critic=False)
 
 

@@ -30,6 +30,8 @@ class _CharacterTokenizer:
 def _make_trainer(*, use_opsd: bool, privileged_input_mode: str = "reason") -> RayPPOTrainer:
     trainer = RayPPOTrainer.__new__(RayPPOTrainer)
     trainer.use_opsd = use_opsd
+    trainer.opsd_rl_coupling = "none"
+    trainer.pure_opsd = use_opsd
     trainer.opsd_teacher_privileged_input_mode = privileged_input_mode
     trainer.tokenizer = _CharacterTokenizer()
     trainer.opsd_teacher_max_prompt_length = 12288
@@ -45,6 +47,7 @@ def _make_batch() -> DataProto:
         tensors={"dummy_tensor": torch.zeros(1, 1, dtype=torch.uint8)},
         non_tensors={
             "raw_prompt": raw_prompts,
+            "data_source": np.array(["open-r1/OpenThoughts-114k-math"], dtype=object),
             "reward_model": reward_models,
             "reason": np.array(["legacy top-level reason"], dtype=object),
             "uid": np.array(["sample-0"], dtype=object),
@@ -53,7 +56,35 @@ def _make_batch() -> DataProto:
     )
 
 
-def test_opsd_gen_batch_is_non_destructive_and_excludes_reason():
+def test_pure_opsd_does_not_initialize_reward_loop_manager():
+    trainer = _make_trainer(use_opsd=True)
+    trainer.pure_opsd = True
+    trainer.reward_loop_manager = object()
+
+    trainer._init_reward_loop_manager()
+
+    assert trainer.reward_loop_manager is None
+
+
+def test_non_pure_training_still_initializes_reward_loop_manager(monkeypatch):
+    trainer = _make_trainer(use_opsd=False)
+    trainer.pure_opsd = False
+    trainer.use_rm = False
+    trainer.config = object()
+    trainer.resource_pool_manager = object()
+    expected_manager = object()
+
+    monkeypatch.setattr(
+        "verl.experimental.reward_loop.RewardLoopManager",
+        lambda *, config, rm_resource_pool: expected_manager,
+    )
+
+    trainer._init_reward_loop_manager()
+
+    assert trainer.reward_loop_manager is expected_manager
+
+
+def test_pure_opsd_gen_batch_is_non_destructive_and_excludes_reward_metadata():
     trainer = _make_trainer(use_opsd=True)
     batch = _make_batch()
 
@@ -63,9 +94,8 @@ def test_opsd_gen_batch_is_non_destructive_and_excludes_reason():
     assert batch.non_tensor_batch["reward_model"][0]["reason"] == "Multiply six by seven."
     assert batch.non_tensor_batch["reason"][0] == "legacy top-level reason"
     assert "reason" not in gen_batch.non_tensor_batch
-    assert "reason" not in gen_batch.non_tensor_batch["reward_model"][0]
-    assert gen_batch.non_tensor_batch["reward_model"][0]["ground_truth"] == "42"
-    assert gen_batch.non_tensor_batch["reward_model"][0] is not batch.non_tensor_batch["reward_model"][0]
+    assert "reward_model" not in gen_batch.non_tensor_batch
+    assert "data_source" not in gen_batch.non_tensor_batch
 
 
 def test_reason_mode_test_evidence_proves_rollout_projection_isolated_reason():
@@ -96,7 +126,7 @@ def test_reason_mode_gen_batch_does_not_require_validation_reason():
 
     gen_batch = trainer._get_gen_batch(batch)
 
-    assert gen_batch.non_tensor_batch["reward_model"][0] == {"ground_truth": "42"}
+    assert "reward_model" not in gen_batch.non_tensor_batch
 
 
 def test_opsd_merge_keeps_controller_metadata_and_adds_rollout_results():
