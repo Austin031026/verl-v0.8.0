@@ -128,7 +128,7 @@ export HF_XET_CACHE=${HF_XET_CACHE:-$FENG_J/hf/xet}
 export TOKENIZERS_PARALLELISM=false
 export PYTHONUNBUFFERED=1
 export TMPDIR=/tmp
-export RAY_TMPDIR=${RAY_TMPDIR:-/tmp/ray_jf42bamu}
+export RAY_TMPDIR=/tmp/ray_jf42bamu
 mkdir -p "$RAY_TMPDIR"
 
 "$PYTHON" "$SCRIPT_DIR/checkpoint_generation_preflight.py" \
@@ -164,6 +164,7 @@ cleanup
 cd "$REPO"
 set +e
 "$PYTHON" -m verl.trainer.main_generation_server \
+    +ray_kwargs.ray_init._temp_dir="$RAY_TMPDIR" \
     trainer.nnodes="$NNODES" \
     trainer.n_gpus_per_node="$NGPUS_PER_NODE" \
     data.train_files="$BENCHMARK_FILE" \

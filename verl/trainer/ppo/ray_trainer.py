@@ -1774,6 +1774,11 @@ class RayPPOTrainer:
                 f"got {self.opsd_teacher_privileged_input_mode!r}."
             )
         privileged_block = f"\n\nTeacher privileged information:\n{privileged_label}: {privileged_text}"
+        if self.opsd_teacher_privileged_input_mode == "reason":
+            privileged_block += (
+                "\n\nAfter understanding the reference solution, please try to solve this problem "
+                "using your own approach below:\n\nAnswer:"
+            )
         target_idx = next(
             (idx for idx in range(len(teacher_messages) - 1, -1, -1) if teacher_messages[idx].get("role") == "user"),
             len(teacher_messages) - 1,

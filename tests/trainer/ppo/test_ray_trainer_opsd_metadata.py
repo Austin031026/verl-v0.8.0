@@ -180,10 +180,21 @@ def test_reason_mode_rejects_missing_empty_or_non_string_reason(invalid_reason):
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_label", "expected_text"),
-    [("answer", "Answer", "42"), ("reason", "Reason", "Multiply six by seven.")],
+    ("mode", "expected_label", "expected_text", "expected_suffix"),
+    [
+        ("answer", "Answer", "42", ""),
+        (
+            "reason",
+            "Reason",
+            "Multiply six by seven.",
+            "\n\nAfter understanding the reference solution, please try to solve this problem "
+            "using your own approach below:\n\nAnswer:",
+        ),
+    ],
 )
-def test_teacher_message_uses_the_configured_privileged_source(mode, expected_label, expected_text):
+def test_teacher_message_uses_the_configured_privileged_source(
+    mode, expected_label, expected_text, expected_suffix
+):
     trainer = _make_trainer(use_opsd=True, privileged_input_mode=mode)
     batch = _make_batch()
     batch, _ = trainer._attach_opsd_teacher_privileged_info(batch)
@@ -194,7 +205,7 @@ def test_teacher_message_uses_the_configured_privileged_source(mode, expected_la
     )
 
     assert messages[0]["content"] == (
-        f"What is 6 * 7?\n\nTeacher privileged information:\n{expected_label}: {expected_text}"
+        f"What is 6 * 7?\n\nTeacher privileged information:\n{expected_label}: {expected_text}{expected_suffix}"
     )
     assert batch.non_tensor_batch["raw_prompt"][0][0]["content"] == "What is 6 * 7?"
 

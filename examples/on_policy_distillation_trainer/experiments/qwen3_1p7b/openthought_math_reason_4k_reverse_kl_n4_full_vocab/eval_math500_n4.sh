@@ -26,7 +26,7 @@ export MODEL_ID=qwen3_1.7b
 export TRAINING_RUN_ID=qwen3_1p7b_openthought_math_reason_4k_reverse_kl_b8_n4_full_vocab
 export MODEL_LABEL="step${CHECKPOINT_STEP}"
 export MODEL_BACKEND=fsdp
-export MODEL_PATH="$FENG_J/checkpoints/qwen3_1p7b_openthought_math_reason_4k_reverse_kl_b8_n4_full_vocab/global_step_${CHECKPOINT_STEP}/actor"
+export MODEL_PATH="$FENG_J/checkpoints/$TRAINING_RUN_ID/global_step_${CHECKPOINT_STEP}/actor"
 
 # Dataset and offline-rescoring contract.
 export BENCHMARK_ID=math500

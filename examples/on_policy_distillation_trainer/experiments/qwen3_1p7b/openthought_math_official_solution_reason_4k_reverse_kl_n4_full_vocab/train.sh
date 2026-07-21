@@ -4,7 +4,7 @@ umask 027
 
 FENG_J=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J
 
-TRAINING_RUN_ID=qwen3_1p7b_openthought_math_reason_4k_reverse_kl_b8_n4_full_vocab
+TRAINING_RUN_ID=qwen3_1p7b_openthought_math_official_solution_reason_4k_reverse_kl_b8_n4_full_vocab
 BUNDLE_DIR="$FENG_J/opsd_training/Qwen3-1.7B/$TRAINING_RUN_ID"
 VERL_ROOT="$FENG_J/verl-v0.8.0-opsd-test"
 
@@ -34,7 +34,7 @@ PY
 )"
 TEACHER_MODEL="$STUDENT_MODEL"
 
-TRAIN_FILE="$FENG_J/data/Openthought-math-open-ri/train_10000_seed42_verl_opsd.parquet"
+TRAIN_FILE="$FENG_J/data/Openthought-math-open-ri/train_10000_seed42_verl_opsd_official_solution_reason.parquet"
 CHECKPOINT_DIR="$FENG_J/checkpoints/$TRAINING_RUN_ID"
 
 # ---------- 实验配置 ----------
