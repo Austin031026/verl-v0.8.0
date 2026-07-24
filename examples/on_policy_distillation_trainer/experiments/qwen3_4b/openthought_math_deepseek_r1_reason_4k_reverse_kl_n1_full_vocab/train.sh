@@ -4,8 +4,8 @@ umask 027
 
 FENG_J=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J
 
-TRAINING_RUN_ID=qwen3_1p7b_openthought_math_official_solution_reason_4k_reverse_kl_b12_n4_full_vocab_g6
-BUNDLE_DIR="$FENG_J/opsd_training/Qwen3-1.7B/$TRAINING_RUN_ID"
+TRAINING_RUN_ID=qwen3_4b_openthought_math_deepseek_r1_reason_4k_reverse_kl_b54_n1_full_vocab_g6
+BUNDLE_DIR="$FENG_J/opsd_training/Qwen3-4B/$TRAINING_RUN_ID"
 VERL_ROOT="$FENG_J/verl-v0.8.0-opsd-test"
 
 CONDA_SH="$FENG_J/conda/miniconda3/etc/profile.d/conda.sh"
@@ -18,40 +18,29 @@ export HF_DATASETS_CACHE="$FENG_J/hf/datasets"
 export TRANSFORMERS_CACHE="$FENG_J/hf/hub"
 export HF_XET_CACHE="$FENG_J/hf/xet"
 
-MODEL_ID=Qwen/Qwen3-1.7B
-PYTHON="$CONDA_ENV/bin/python"
-
-STUDENT_MODEL="$("$PYTHON" - <<'PY'
-from huggingface_hub import snapshot_download
-
-print(
-    snapshot_download(
-        repo_id="Qwen/Qwen3-1.7B",
-        local_files_only=True,
-    )
-)
-PY
-)"
+MODEL_ID=Qwen/Qwen3-4B
+STUDENT_MODEL="$FENG_J/models/Qwen3-4B"
 TEACHER_MODEL="$STUDENT_MODEL"
 
-TRAIN_FILE="$FENG_J/data/Openthought-math-open-ri/train_10000_seed42_verl_opsd_official_solution_reason.parquet"
+TRAIN_FILE="$FENG_J/data/Ashkchamp-Openthoughts_math_filtered_30K/train_10000_seed42_verl_opsd_deepseek_r1_reason.parquet"
 CHECKPOINT_DIR="$FENG_J/checkpoints/$TRAINING_RUN_ID"
 
 # ---------- 实验配置 ----------
 
 EXPERIMENT_NAME="$TRAINING_RUN_ID"
 NGPUS_PER_NODE=6
-TRAIN_BATCH_SIZE=12
+TRAIN_BATCH_SIZE=54
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=4096
 ENABLE_THINKING=False
 
-ROLLOUT_N=4
+ROLLOUT_N=1
 ROLLOUT_DO_SAMPLE=True
 ROLLOUT_TEMPERATURE=0.7
 ROLLOUT_TOP_P=0.8
 ROLLOUT_TOP_K=20
 
+OPSD_REASON_SOURCE=deepseek_r1
 OPSD_PRIVILEGED_INPUT_MODE=reason
 OPSD_KL_MODE=reverse_kl
 OPSD_RL_COUPLING=none
@@ -183,12 +172,16 @@ echo "Checkpoint directory: $CHECKPOINT_DIR"
 {
 printf '%s\n' \
     '===== OPSD experiment configuration =====' \
+    "model_id=$MODEL_ID" \
+    "model_path=$STUDENT_MODEL" \
     "experiment_name=$EXPERIMENT_NAME" \
     "gpus_per_node=$NGPUS_PER_NODE" \
     "train_batch_size=$TRAIN_BATCH_SIZE" \
     "rollout.n=$ROLLOUT_N" \
     "trajectories_per_update=$((TRAIN_BATCH_SIZE * ROLLOUT_N))" \
     "trajectories_per_gpu=$((TRAIN_BATCH_SIZE * ROLLOUT_N / NGPUS_PER_NODE))" \
+    "worst_joint_micro_batch_per_gpu=3" \
+    "worst_joint_groups_per_gpu=3" \
     "rollout.do_sample=$ROLLOUT_DO_SAMPLE" \
     "rollout.temperature=$ROLLOUT_TEMPERATURE" \
     "rollout.top_p=$ROLLOUT_TOP_P" \
@@ -196,13 +189,14 @@ printf '%s\n' \
     "student.max_prompt_length=$MAX_PROMPT_LENGTH" \
     "student.max_response_length=$MAX_RESPONSE_LENGTH" \
     "student.enable_thinking=$ENABLE_THINKING" \
+    "opsd.reason_source=$OPSD_REASON_SOURCE" \
     "opsd.privileged_input.mode=$OPSD_PRIVILEGED_INPUT_MODE" \
     "opsd.kl_mode=$OPSD_KL_MODE" \
     "opsd.rl_coupling=$OPSD_RL_COUPLING" \
     "opsd.vocab_strategy=$OPSD_VOCAB_STRATEGY" \
     '========================================='
 
-# The fixed reason reference template is 84 Qwen3 tokens; use 128-aligned Teacher limits.
+# The fixed reason reference template is 84 Qwen3 tokens; use aligned Teacher limits.
 env \
     STUDENT_MODEL="$STUDENT_MODEL" \
     OPSD_TEACHER_MODEL="$TEACHER_MODEL" \
@@ -213,7 +207,7 @@ env \
     PPO_MINI_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
     MAX_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" \
     MAX_RESPONSE_LENGTH="$MAX_RESPONSE_LENGTH" \
-    PPO_MAX_TOKEN_LEN_PER_GPU=24576 \
+    PPO_MAX_TOKEN_LEN_PER_GPU=18432 \
     ENABLE_THINKING="$ENABLE_THINKING" \
     ACTOR_LR=1e-6 \
     ROLLOUT_TP=1 \
@@ -226,10 +220,10 @@ env \
     OPSD_TEACHER_MAX_PROMPT_LENGTH=10336 \
     OPSD_TEACHER_MAX_CONTEXT_NO_THINK=14432 \
     OPSD_TEACHER_MAX_CONTEXT_THINKING=14432 \
-    OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU=57728 \
-    TOTAL_TRAINING_STEPS=833 \
+    OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU=43296 \
+    TOTAL_TRAINING_STEPS=185 \
     TOTAL_EPOCHS=1 \
-    SAVE_FREQ=200 \
+    SAVE_FREQ=20 \
     TEST_FREQ=-1 \
     LOGGER='["console","file"]' \
     PROJECT_NAME=verl_opsd \

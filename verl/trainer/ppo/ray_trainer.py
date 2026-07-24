@@ -1767,17 +1767,11 @@ class RayPPOTrainer:
         if not teacher_messages:
             raise ValueError("OPSD teacher input requires a non-empty raw_prompt.")
 
-        privileged_label = {"answer": "Answer", "reason": "Reason"}.get(self.opsd_teacher_privileged_input_mode)
-        if privileged_label is None:
+        mode = self.opsd_teacher_privileged_input_mode
+        if mode not in {"answer", "reason"}:
             raise ValueError(
                 "OPSD teacher message construction requires privileged input mode 'answer' or 'reason', "
-                f"got {self.opsd_teacher_privileged_input_mode!r}."
-            )
-        privileged_block = f"\n\nTeacher privileged information:\n{privileged_label}: {privileged_text}"
-        if self.opsd_teacher_privileged_input_mode == "reason":
-            privileged_block += (
-                "\n\nAfter understanding the reference solution, please try to solve this problem "
-                "using your own approach below:\n\nAnswer:"
+                f"got {mode!r}."
             )
         target_idx = next(
             (idx for idx in range(len(teacher_messages) - 1, -1, -1) if teacher_messages[idx].get("role") == "user"),
@@ -1786,6 +1780,29 @@ class RayPPOTrainer:
 
         target_message = dict(teacher_messages[target_idx])
         content = target_message.get("content", "")
+        if mode == "reason":
+            reference_block = (
+                "\n\nHere is a reference solution to this problem:\n"
+                "=== Reference Solution Begin ===\n"
+                f"{privileged_text}\n"
+                "=== Reference Solution End ===\n\n"
+                "After reading the reference solution above, make sure you truly\n"
+                "understand the reasoning behind each step — do not copy or paraphrase it.\n"
+                "Now, using your own words and independent reasoning, derive the same\n"
+                "final answer.\n\n"
+                "Please reason step by step, and put your final answer within \\boxed{}."
+            )
+            if isinstance(content, str):
+                target_message["content"] = f"Problem: {content}{reference_block}"
+            elif isinstance(content, list):
+                # Preserve existing multimodal problem segments and append only the reference instructions.
+                target_message["content"] = list(content) + [{"type": "text", "text": reference_block}]
+            else:
+                raise TypeError(f"Unsupported raw_prompt content type for OPSD teacher input: {type(content)}.")
+            teacher_messages[target_idx] = target_message
+            return teacher_messages
+
+        privileged_block = f"\n\nTeacher privileged information:\nAnswer: {privileged_text}"
         if isinstance(content, str):
             target_message["content"] = content + privileged_block
         elif isinstance(content, list):

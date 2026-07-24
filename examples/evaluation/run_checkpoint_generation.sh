@@ -28,6 +28,7 @@ RESULTS_ROOT=${RESULTS_ROOT:-$FENG_J/benchmark_results}
 : "${GENERATION_TEMPERATURE:?Set GENERATION_TEMPERATURE}"
 : "${GENERATION_TOP_P:?Set GENERATION_TOP_P}"
 : "${GENERATION_TOP_K:?Set GENERATION_TOP_K}"
+: "${GENERATION_MIN_P:?Set GENERATION_MIN_P}"
 : "${NGPUS_PER_NODE:?Set NGPUS_PER_NODE}"
 : "${ROLLOUT_TP:?Set ROLLOUT_TP}"
 : "${ROLLOUT_GPU_MEM_UTIL:?Set ROLLOUT_GPU_MEM_UTIL}"
@@ -171,6 +172,7 @@ set +e
     data.prompt_key="$PROMPT_KEY" \
     +data.output_path="$GENERATION_PARQUET" \
     +data.generation_batch_size="$GENERATION_BATCH_SIZE" \
+    +data.generation_min_p="$GENERATION_MIN_P" \
     +data.apply_chat_template_kwargs.enable_thinking="$ENABLE_THINKING" \
     actor_rollout_ref.model.path="$MODEL_PATH" \
     actor_rollout_ref.model.trust_remote_code=True \

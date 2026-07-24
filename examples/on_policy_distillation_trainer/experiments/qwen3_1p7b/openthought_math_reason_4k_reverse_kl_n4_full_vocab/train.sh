@@ -4,7 +4,7 @@ umask 027
 
 FENG_J=/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J
 
-TRAINING_RUN_ID=qwen3_1p7b_openthought_math_reason_4k_reverse_kl_b8_n4_full_vocab
+TRAINING_RUN_ID=qwen3_1p7b_openthought_math_reason_4k_reverse_kl_b12_n4_full_vocab_g6
 BUNDLE_DIR="$FENG_J/opsd_training/Qwen3-1.7B/$TRAINING_RUN_ID"
 VERL_ROOT="$FENG_J/verl-v0.8.0-opsd-test"
 
@@ -40,7 +40,8 @@ CHECKPOINT_DIR="$FENG_J/checkpoints/$TRAINING_RUN_ID"
 # ---------- 实验配置 ----------
 
 EXPERIMENT_NAME="$TRAINING_RUN_ID"
-TRAIN_BATCH_SIZE=8
+NGPUS_PER_NODE=6
+TRAIN_BATCH_SIZE=12
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=4096
 ENABLE_THINKING=False
@@ -79,6 +80,11 @@ fi
 
 if [[ ! -f "$TRAIN_FILE" ]]; then
     echo "Missing training file: $TRAIN_FILE" >&2
+    exit 2
+fi
+
+if (( (TRAIN_BATCH_SIZE * ROLLOUT_N) % NGPUS_PER_NODE != 0 )); then
+    echo "trajectories_per_update must be divisible by NGPUS_PER_NODE" >&2
     exit 2
 fi
 
@@ -178,9 +184,11 @@ echo "Checkpoint directory: $CHECKPOINT_DIR"
 printf '%s\n' \
     '===== OPSD experiment configuration =====' \
     "experiment_name=$EXPERIMENT_NAME" \
+    "gpus_per_node=$NGPUS_PER_NODE" \
     "train_batch_size=$TRAIN_BATCH_SIZE" \
     "rollout.n=$ROLLOUT_N" \
     "trajectories_per_update=$((TRAIN_BATCH_SIZE * ROLLOUT_N))" \
+    "trajectories_per_gpu=$((TRAIN_BATCH_SIZE * ROLLOUT_N / NGPUS_PER_NODE))" \
     "rollout.do_sample=$ROLLOUT_DO_SAMPLE" \
     "rollout.temperature=$ROLLOUT_TEMPERATURE" \
     "rollout.top_p=$ROLLOUT_TOP_P" \
@@ -194,13 +202,13 @@ printf '%s\n' \
     "opsd.vocab_strategy=$OPSD_VOCAB_STRATEGY" \
     '========================================='
 
-# The reason-only answer instruction is 21 Qwen3 tokens; reserve 32 tokens in Teacher limits.
+# The fixed reason reference template is 84 Qwen3 tokens; use 128-aligned Teacher limits.
 env \
     STUDENT_MODEL="$STUDENT_MODEL" \
     OPSD_TEACHER_MODEL="$TEACHER_MODEL" \
     OPSD_TEACHER_PRIVILEGED_INPUT_MODE="$OPSD_PRIVILEGED_INPUT_MODE" \
     NNODES=1 \
-    NGPUS_PER_NODE=4 \
+    NGPUS_PER_NODE="$NGPUS_PER_NODE" \
     TRAIN_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
     PPO_MINI_BATCH_SIZE="$TRAIN_BATCH_SIZE" \
     MAX_PROMPT_LENGTH="$MAX_PROMPT_LENGTH" \
@@ -215,11 +223,11 @@ env \
     OPSD_VOCAB_STRATEGY="$OPSD_VOCAB_STRATEGY" \
     OPSD_LOSS_COEF=1.0 \
     OPSD_TEMPERATURE=1.0 \
-    OPSD_TEACHER_MAX_PROMPT_LENGTH=12320 \
-    OPSD_TEACHER_MAX_CONTEXT_NO_THINK=16416 \
-    OPSD_TEACHER_MAX_CONTEXT_THINKING=16416 \
-    OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU=65536 \
-    TOTAL_TRAINING_STEPS=1250 \
+    OPSD_TEACHER_MAX_PROMPT_LENGTH=10336 \
+    OPSD_TEACHER_MAX_CONTEXT_NO_THINK=14432 \
+    OPSD_TEACHER_MAX_CONTEXT_THINKING=14432 \
+    OPSD_TEACHER_MAX_TOKEN_LEN_PER_GPU=57728 \
+    TOTAL_TRAINING_STEPS=833 \
     TOTAL_EPOCHS=1 \
     SAVE_FREQ=200 \
     TEST_FREQ=-1 \

@@ -180,21 +180,28 @@ def test_reason_mode_rejects_missing_empty_or_non_string_reason(invalid_reason):
 
 
 @pytest.mark.parametrize(
-    ("mode", "expected_label", "expected_text", "expected_suffix"),
+    ("mode", "expected_content"),
     [
-        ("answer", "Answer", "42", ""),
+        (
+            "answer",
+            "What is 6 * 7?\n\nTeacher privileged information:\nAnswer: 42",
+        ),
         (
             "reason",
-            "Reason",
-            "Multiply six by seven.",
-            "\n\nAfter understanding the reference solution, please try to solve this problem "
-            "using your own approach below:\n\nAnswer:",
+            "Problem: What is 6 * 7?\n\n"
+            "Here is a reference solution to this problem:\n"
+            "=== Reference Solution Begin ===\n"
+            "Multiply six by seven.\n"
+            "=== Reference Solution End ===\n\n"
+            "After reading the reference solution above, make sure you truly\n"
+            "understand the reasoning behind each step — do not copy or paraphrase it.\n"
+            "Now, using your own words and independent reasoning, derive the same\n"
+            "final answer.\n\n"
+            "Please reason step by step, and put your final answer within \\boxed{}.",
         ),
     ],
 )
-def test_teacher_message_uses_the_configured_privileged_source(
-    mode, expected_label, expected_text, expected_suffix
-):
+def test_teacher_message_uses_the_configured_privileged_source(mode, expected_content):
     trainer = _make_trainer(use_opsd=True, privileged_input_mode=mode)
     batch = _make_batch()
     batch, _ = trainer._attach_opsd_teacher_privileged_info(batch)
@@ -204,10 +211,12 @@ def test_teacher_message_uses_the_configured_privileged_source(
         batch.non_tensor_batch["opsd_teacher_privileged_text"][0],
     )
 
-    assert messages[0]["content"] == (
-        f"What is 6 * 7?\n\nTeacher privileged information:\n{expected_label}: {expected_text}{expected_suffix}"
-    )
+    assert messages[0]["content"] == expected_content
     assert batch.non_tensor_batch["raw_prompt"][0][0]["content"] == "What is 6 * 7?"
+    if mode == "reason":
+        assert messages[0]["content"].count("Problem: What is 6 * 7?") == 1
+        assert messages[0]["content"].count("=== Reference Solution Begin ===") == 1
+        assert messages[0]["content"].count("=== Reference Solution End ===") == 1
 
 
 def test_teacher_prompt_limit_applies_after_question_reason_and_template_are_combined():

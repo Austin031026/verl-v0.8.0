@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "validation_id": "qwen3_4b_openthought_official_solution",
+  "algorithm_id": "opsd_reason_official_solution",
+  "model_id": "qwen3_4b",
+  "training_run_id": "qwen3_4b_openthought_math_official_solution_reason_4k_reverse_kl_b54_n1_full_vocab_g6",
+  "checkpoint": {
+    "root": "checkpoints/qwen3_4b_openthought_math_official_solution_reason_4k_reverse_kl_b54_n1_full_vocab_g6",
+    "backend": "fsdp",
+    "actor_subdir": "actor",
+    "steps": []
+  },
+  "generation": {
+    "enable_thinking": false,
+    "max_response_length": 4096,
+    "expected_response_length": 4096,
+    "do_sample": true,
+    "temperature": 0.7,
+    "top_p": 0.8,
+    "top_k": 20,
+    "min_p": 0.0,
+    "n_samples": 16
+  },
+  "rollout_runtime": {
+    "tensor_parallel_size": 1,
+    "generation_batch_size": 9,
+    "max_num_seqs_per_replica": 24,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.7,
+    "runtime_reserve_gib": 12
+  },
+  "rescoring": {
+    "enabled": true
+  }
+}

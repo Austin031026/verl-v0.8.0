@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "environment_id": "feng_j_1node_6x80gb",
+  "workspace_root": "/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J",
+  "python": {
+    "verl": "conda/envs/verl_v080_official_script/bin/python",
+    "ye_rescore": "conda/envs/ye_rescore/bin/python"
+  },
+  "paths": {
+    "ye_parser": "Lulu_OPSD-main/parser.py",
+    "results_root": "checkpoint_validation_results",
+    "work_root": "evaluation_work/checkpoint_generation_matrix"
+  },
+  "hardware": {
+    "nnodes": 1,
+    "gpus_per_node": 6,
+    "physical_vram_gib": 80
+  }
+}

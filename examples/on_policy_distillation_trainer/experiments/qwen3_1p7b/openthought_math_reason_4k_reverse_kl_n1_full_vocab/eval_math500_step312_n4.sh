@@ -34,7 +34,7 @@ export GENERATION_TOP_K=20
 
 # Standalone vLLM resources.
 export NNODES=1
-export NGPUS_PER_NODE=4
+export NGPUS_PER_NODE=6
 export ROLLOUT_TP=1
 export ROLLOUT_GPU_MEM_UTIL=0.90
 export MAX_NUM_SEQS=128

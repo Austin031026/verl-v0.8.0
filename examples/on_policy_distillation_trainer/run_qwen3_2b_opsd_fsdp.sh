@@ -13,10 +13,10 @@ OPSD_TEACHER_MODEL=${OPSD_TEACHER_MODEL:-$STUDENT_MODEL}
 opsd_teacher_privileged_input_mode=${OPSD_TEACHER_PRIVILEGED_INPUT_MODE:-answer}
 
 NNODES=${NNODES:-1}
-NGPUS_PER_NODE=${NGPUS_PER_NODE:-4}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-6}
 
-train_batch_size=${TRAIN_BATCH_SIZE:-32}
-ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-32}
+train_batch_size=${TRAIN_BATCH_SIZE:-48}
+ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE:-48}
 max_prompt_length=${MAX_PROMPT_LENGTH:-1024}
 max_response_length=${MAX_RESPONSE_LENGTH:-1024}
 ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN_PER_GPU:-12288}

@@ -144,6 +144,7 @@ def main(config):
         "temperature": config.actor_rollout_ref.rollout.temperature,
         "top_p": config.actor_rollout_ref.rollout.top_p,
         "top_k": config.actor_rollout_ref.rollout.top_k,
+        "min_p": float(config.data.get("generation_min_p", 0.0)),
         "max_tokens": config.actor_rollout_ref.rollout.response_length,
     }
     chat_template_kwargs = config.data.get("apply_chat_template_kwargs", None)

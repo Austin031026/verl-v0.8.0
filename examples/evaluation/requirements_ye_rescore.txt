@@ -1,0 +1,5 @@
+numpy<2.0.0
+regex
+sympy
+word2number
+latex2sympy2==1.9.1

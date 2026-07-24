@@ -48,9 +48,9 @@ export GENERATION_TEMPERATURE=0.7
 export GENERATION_TOP_P=0.8
 export GENERATION_TOP_K=20
 
-# Four TP=1 replicas, with at most 128 resident sequences requested per replica.
+# Six TP=1 replicas, with at most 128 resident sequences requested per replica.
 export NNODES=1
-export NGPUS_PER_NODE=4
+export NGPUS_PER_NODE=6
 export ROLLOUT_TP=1
 export ROLLOUT_GPU_MEM_UTIL=0.90
 export MAX_NUM_SEQS=128

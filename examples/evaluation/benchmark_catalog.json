@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "benchmarks": {
+    "math500": {
+      "enabled": true,
+      "data_path": "data/MATH-500/test_verl.parquet",
+      "expected_prompts": 500,
+      "prompt_key": "prompt",
+      "responses_key": "responses",
+      "ground_truth_field": "reward_model.ground_truth",
+      "ye_data_name": "math",
+      "max_prompt_length": 2048
+    },
+    "aime24": {
+      "enabled": true,
+      "data_path": "data/AIME24/test_verl.parquet",
+      "expected_prompts": 30,
+      "prompt_key": "prompt",
+      "responses_key": "responses",
+      "ground_truth_field": "reward_model.ground_truth",
+      "ye_data_name": "aime24",
+      "max_prompt_length": 2048
+    },
+    "aime25": {
+      "enabled": true,
+      "data_path": "data/AIME25/test_verl.parquet",
+      "expected_prompts": 30,
+      "prompt_key": "prompt",
+      "responses_key": "responses",
+      "ground_truth_field": "reward_model.ground_truth",
+      "ye_data_name": "aime25",
+      "max_prompt_length": 2048
+    },
+    "gsm8k": {
+      "enabled": true,
+      "data_path": "data/gsm8k/test.parquet",
+      "expected_prompts": 1319,
+      "prompt_key": "prompt",
+      "responses_key": "responses",
+      "ground_truth_field": "reward_model.ground_truth",
+      "ye_data_name": "gsm8k",
+      "max_prompt_length": 2048
+    }
+  }
+}
