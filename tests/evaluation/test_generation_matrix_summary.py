@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +22,155 @@ def load_matrix_module():
 
 
 class GenerationMatrixSummaryTest(unittest.TestCase):
+    def test_rescore_only_creates_required_outputs_without_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            result_root = root / "results" / "run_1"
+            step_root = result_root / "step_20"
+            step_root.mkdir(parents=True)
+            raw_jsonl = step_root / "math500.jsonl"
+            raw_jsonl.write_text(
+                json.dumps(
+                    {
+                        "training_run_id": "run_1",
+                        "checkpoint_step": 20,
+                        "checkpoint_id": "step_20",
+                        "benchmark_id": "math500",
+                        "sample_uid": "question_0",
+                        "rollout_id": 0,
+                        "input": "What is one?",
+                        "output": "The answer is 1",
+                        "gts": "1",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            parser_path = root / "parser.py"
+            parser_path.write_text(
+                "def extract_answer(text, data_name=None):\n"
+                "    return text.rsplit(' ', 1)[-1]\n"
+                "def strip_string(text):\n"
+                "    return str(text)\n"
+                "def math_equal(left, right):\n"
+                "    return left == right\n",
+                encoding="utf-8",
+            )
+            environment_path = root / "environment.json"
+            environment_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "environment_id": "test_environment",
+                        "workspace_root": str(root),
+                        "python": {
+                            "verl": sys.executable,
+                            "ye_rescore": sys.executable,
+                        },
+                        "paths": {
+                            "ye_parser": str(parser_path),
+                            "results_root": "results",
+                            "work_root": "work",
+                        },
+                        "hardware": {
+                            "nnodes": 1,
+                            "gpus_per_node": 1,
+                            "physical_vram_gib": 80,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            validation_path = root / "validation.json"
+            validation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "validation_id": "test_validation",
+                        "algorithm_id": "opsd",
+                        "model_id": "qwen3_4b",
+                        "training_run_id": "run_1",
+                        "checkpoint": {
+                            "root": "missing_checkpoints",
+                            "backend": "fsdp",
+                            "actor_subdir": "actor",
+                            "steps": [20],
+                        },
+                        "generation": {
+                            "enable_thinking": False,
+                            "max_response_length": 4096,
+                            "expected_response_length": 4096,
+                            "do_sample": True,
+                            "temperature": 0.7,
+                            "top_p": 0.8,
+                            "top_k": 20,
+                            "min_p": 0.0,
+                            "n_samples": 1,
+                        },
+                        "rollout_runtime": {
+                            "tensor_parallel_size": 1,
+                            "generation_batch_size": 1,
+                            "max_num_seqs_per_replica": 1,
+                            "max_num_batched_tokens": 8192,
+                            "gpu_memory_utilization": 0.7,
+                            "runtime_reserve_gib": 12,
+                        },
+                        "rescoring": {"enabled": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            catalog_path = root / "catalog.json"
+            catalog_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "benchmarks": {
+                            "math500": {
+                                "enabled": True,
+                                "data_path": "missing_math500.parquet",
+                                "expected_prompts": 1,
+                                "prompt_key": "prompt",
+                                "responses_key": "responses",
+                                "ground_truth_field": "reward_model.ground_truth",
+                                "ye_data_name": "math",
+                                "max_prompt_length": 2048,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(MATRIX_SCRIPT),
+                    "--environment-config",
+                    str(environment_path),
+                    "--validation-config",
+                    str(validation_path),
+                    "--catalog",
+                    str(catalog_path),
+                    "--benchmarks",
+                    "math500",
+                    "--rescore-only",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("SKIP generation: step_20/math500", completed.stdout)
+            self.assertNotIn("RUN step_20/math500", completed.stdout)
+            self.assertIn("ye_rescored=1", completed.stdout)
+            self.assertTrue((step_root / "math500.ye_rescored.jsonl").is_file())
+            self.assertTrue((step_root / "math500.ye_metrics.json").is_file())
+            self.assertTrue((step_root / "ye_benchmark_summary.json").is_file())
+            manifest = json.loads((result_root / "manifest.json").read_text())
+            self.assertEqual(manifest["status"], "complete")
+
     def test_checked_in_qwen3_4b_validations_are_no_thinking_sampled(self) -> None:
         validation_dir = (
             REPO_ROOT / "examples" / "evaluation" / "configs" / "validation"
@@ -116,6 +267,58 @@ class GenerationMatrixSummaryTest(unittest.TestCase):
         validation["generation"]["temperature"] = 0
         with self.assertRaisesRegex(ValueError, "temperature"):
             matrix.resolve_evaluation_config(environment, validation)
+
+        validation["generation"]["temperature"] = 0.7
+        validation["rescoring"]["enabled"] = False
+        with self.assertRaisesRegex(ValueError, "rescoring.enabled=true"):
+            matrix.resolve_evaluation_config(environment, validation)
+
+    def test_requires_all_ye_sidecars_and_checkpoint_summaries(self) -> None:
+        matrix = load_matrix_module()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            details = root / "math500.ye_rescored.jsonl"
+            metrics = root / "math500.ye_metrics.json"
+            checkpoint_summary = root / "ye_benchmark_summary.json"
+            details.write_text("{}\n", encoding="utf-8")
+            metrics.write_text("{}\n", encoding="utf-8")
+            checkpoint_summary.write_text(
+                json.dumps({"status": "complete"}), encoding="utf-8"
+            )
+            task_status = {
+                "step_20/math500": {
+                    "status": "complete",
+                    "ye_rescore": {
+                        "details_path": str(details),
+                        "summary_path": str(metrics),
+                    },
+                }
+            }
+            checkpoint_summaries = {
+                "step_20": {
+                    "status": "complete",
+                    "summary_path": str(checkpoint_summary),
+                }
+            }
+
+            self.assertEqual(
+                matrix.audit_required_rescore_outputs(
+                    task_keys=["step_20/math500"],
+                    checkpoint_steps=[20],
+                    task_status=task_status,
+                    checkpoint_summaries=checkpoint_summaries,
+                ),
+                [],
+            )
+
+            details.unlink()
+            errors = matrix.audit_required_rescore_outputs(
+                task_keys=["step_20/math500"],
+                checkpoint_steps=[20],
+                task_status=task_status,
+                checkpoint_summaries=checkpoint_summaries,
+            )
+            self.assertTrue(any("missing details_path" in error for error in errors))
 
     def test_writes_one_summary_for_all_selected_benchmarks(self) -> None:
         matrix = load_matrix_module()

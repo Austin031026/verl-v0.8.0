@@ -4,7 +4,7 @@
   "workspace_root": "/pfss/mlde/workspaces/mlde_wsp_Model_Distil/Feng_J",
   "python": {
     "verl": "conda/envs/verl_v080_official_script/bin/python",
-    "ye_rescore": "conda/envs/ye_rescore/bin/python"
+    "ye_rescore": "conda/envs/lulu_probe_qwen3/bin/python"
   },
   "paths": {
     "ye_parser": "Lulu_OPSD-main/parser.py",

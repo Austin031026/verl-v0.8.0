@@ -260,6 +260,11 @@ all still match. Each task's Ye metrics and sidecar paths are also recorded in
 inspect the resolved matrix without accessing cluster files, and
 `--continue-on-error` to continue after a failed task.
 
+Matrix validation requires `rescoring.enabled=true` and cannot report success
+without every Ye sidecar and checkpoint summary. Use `--rescore-only` to repair
+complete raw JSONLs from an older generation-only run; it refuses GPU
+generation if any selected raw result is missing or structurally incomplete.
+
 After the last selected benchmark for each checkpoint, the matrix prints one
 checkpoint-level table and writes `step_<N>/ye_benchmark_summary.json`. It
 contains every selected benchmark's rollout accuracy / Pass@1 estimator,

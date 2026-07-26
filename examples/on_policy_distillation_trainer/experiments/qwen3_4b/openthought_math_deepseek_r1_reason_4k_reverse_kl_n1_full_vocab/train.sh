@@ -29,6 +29,7 @@ CHECKPOINT_DIR="$FENG_J/checkpoints/$TRAINING_RUN_ID"
 
 EXPERIMENT_NAME="$TRAINING_RUN_ID"
 NGPUS_PER_NODE=6
+AGENT_LOOP_WORKERS=6
 TRAIN_BATCH_SIZE=54
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=4096
@@ -74,6 +75,11 @@ fi
 
 if (( (TRAIN_BATCH_SIZE * ROLLOUT_N) % NGPUS_PER_NODE != 0 )); then
     echo "trajectories_per_update must be divisible by NGPUS_PER_NODE" >&2
+    exit 2
+fi
+
+if (( (TRAIN_BATCH_SIZE * ROLLOUT_N) % AGENT_LOOP_WORKERS != 0 )); then
+    echo "trajectories_per_update must be divisible by AGENT_LOOP_WORKERS" >&2
     exit 2
 fi
 
@@ -176,6 +182,7 @@ printf '%s\n' \
     "model_path=$STUDENT_MODEL" \
     "experiment_name=$EXPERIMENT_NAME" \
     "gpus_per_node=$NGPUS_PER_NODE" \
+    "agent_loop_workers=$AGENT_LOOP_WORKERS" \
     "train_batch_size=$TRAIN_BATCH_SIZE" \
     "rollout.n=$ROLLOUT_N" \
     "trajectories_per_update=$((TRAIN_BATCH_SIZE * ROLLOUT_N))" \
@@ -241,6 +248,7 @@ env \
     actor_rollout_ref.rollout.ignore_eos=False \
     actor_rollout_ref.rollout.max_num_seqs=8 \
     actor_rollout_ref.rollout.max_num_batched_tokens=8192 \
+    actor_rollout_ref.rollout.agent.num_workers="$AGENT_LOOP_WORKERS" \
     actor_rollout_ref.rollout.skip.enable=False \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.shuffle=False \

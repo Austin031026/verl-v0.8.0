@@ -330,6 +330,19 @@ summary while continuing later tasks. Use `--force` only when complete raw
 rollouts must be regenerated. Without `--force`, structurally complete raw
 JSONL and matching Ye sidecars are reused.
 
+Ye rescoring is mandatory in the matrix workflow. The validation config must
+set `rescoring.enabled=true`; otherwise preflight fails. The matrix reports
+success only after every raw JSONL has both Ye sidecars and every checkpoint
+has a complete `ye_benchmark_summary.json`.
+
+To repair an older generation-only result without allocating GPUs, run the
+same matrix selection with `--rescore-only`. This mode refuses to generate or
+replace a raw JSONL and fails if any selected raw output is incomplete:
+
+```text
+--rescore-only
+```
+
 ## Outputs
 
 Final results are independent from training logs and checkpoints:

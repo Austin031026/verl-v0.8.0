@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Regenerate complete existing outputs.")
     parser.add_argument(
+        "--rescore-only",
+        action="store_true",
+        help=(
+            "Require every raw JSONL to be complete, skip GPU generation, and run only "
+            "mandatory Ye rescoring plus checkpoint summaries."
+        ),
+    )
+    parser.add_argument(
         "--continue-on-error",
         action="store_true",
         help="Continue with later matrix tasks after a task fails.",
@@ -157,6 +165,11 @@ def resolve_evaluation_config(
     rescoring = require_mapping(validation, "rescoring")
     if not isinstance(rescoring.get("enabled"), bool):
         raise ValueError("validation.rescoring.enabled must be true or false")
+    if not rescoring["enabled"]:
+        raise ValueError(
+            "Matrix validation requires validation.rescoring.enabled=true; "
+            "generation-only runs must use run_checkpoint_generation.sh instead"
+        )
 
     return {
         "schema_version": 1,
@@ -427,7 +440,10 @@ def resolve_rescoring(
     if not isinstance(enabled, bool):
         raise ValueError("rescoring.enabled must be true or false")
     if not enabled:
-        return False, None, None, None
+        raise ValueError(
+            "Matrix validation requires Ye Wenxuan rescoring; "
+            "use run_checkpoint_generation.sh for generation-only output"
+        )
 
     scorer = script_dir / "rescore_generation_jsonl.py"
     if not scorer.is_file():
@@ -583,6 +599,46 @@ def write_checkpoint_summary(
     return summary_path, summary
 
 
+def audit_required_rescore_outputs(
+    *,
+    task_keys: list[str],
+    checkpoint_steps: list[int],
+    task_status: dict[str, Any],
+    checkpoint_summaries: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+
+    for task_key in task_keys:
+        task = task_status.get(task_key)
+        if not isinstance(task, dict) or task.get("status") != "complete":
+            errors.append(f"{task_key}: task is not complete")
+            continue
+        rescore = task.get("ye_rescore")
+        if not isinstance(rescore, dict):
+            errors.append(f"{task_key}: missing Ye rescore record")
+            continue
+        for field in ("details_path", "summary_path"):
+            path = Path(str(rescore.get(field, "")))
+            if not path.is_file():
+                errors.append(f"{task_key}: missing {field} artifact: {path}")
+
+    for step in checkpoint_steps:
+        checkpoint_id = f"step_{step}"
+        record = checkpoint_summaries.get(checkpoint_id)
+        if not isinstance(record, dict) or record.get("status") != "complete":
+            errors.append(f"{checkpoint_id}: checkpoint summary is not complete")
+            continue
+        summary_path = Path(str(record.get("summary_path", "")))
+        if not summary_path.is_file():
+            errors.append(f"{checkpoint_id}: missing checkpoint summary: {summary_path}")
+            continue
+        summary = load_json(summary_path)
+        if summary.get("status") != "complete":
+            errors.append(f"{checkpoint_id}: checkpoint summary file is incomplete")
+
+    return errors
+
+
 def task_environment(
     *,
     config: dict[str, Any],
@@ -703,6 +759,8 @@ def task_environment(
 
 def main() -> int:
     args = parse_args()
+    if args.rescore_only and args.force:
+        raise ValueError("--rescore-only and --force cannot be used together")
     environment_config = load_json(args.environment_config)
     validation_config = load_json(args.validation_config)
     config = resolve_evaluation_config(environment_config, validation_config)
@@ -764,6 +822,7 @@ def main() -> int:
     )
     print(f"final root      : {final_root}")
     print(f"work root       : {work_root}")
+    print(f"operation       : {'Ye rescore only' if args.rescore_only else 'generation + Ye rescore'}")
     print(
         "offline rescore : "
         + (
@@ -872,6 +931,11 @@ def main() -> int:
         stage = "generation"
         try:
             if not generation_complete:
+                if args.rescore_only:
+                    raise RuntimeError(
+                        "--rescore-only requires a structurally complete existing raw JSONL; "
+                        f"refusing GPU generation for {destination}"
+                    )
                 if not checkpoint_path.is_dir():
                     raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
                 benchmark_path = Path(str(benchmark["data_path"]))
@@ -977,7 +1041,38 @@ def main() -> int:
                 manifest["updated_at_utc"] = utc_now()
                 write_json_atomic(manifest_path, manifest)
 
-    print(f"Generation matrix finished: tasks={len(tasks)}, failures={failures}")
+    task_keys = [f"step_{step}/{benchmark_id}" for step, _, benchmark_id, _, _ in tasks]
+    completion_errors = audit_required_rescore_outputs(
+        task_keys=task_keys,
+        checkpoint_steps=steps,
+        task_status=task_status,
+        checkpoint_summaries=checkpoint_summaries,
+    )
+    if completion_errors:
+        if failures == 0:
+            failures = 1
+        manifest["status"] = "incomplete"
+        manifest["completion_errors"] = completion_errors
+        for error in completion_errors:
+            print(f"INCOMPLETE: {error}", file=sys.stderr)
+    else:
+        manifest["status"] = "complete"
+        manifest.pop("completion_errors", None)
+    manifest["updated_at_utc"] = utc_now()
+    write_json_atomic(manifest_path, manifest)
+
+    rescored_tasks = sum(
+        isinstance(task_status.get(task_key, {}).get("ye_rescore"), dict)
+        for task_key in task_keys
+    )
+    complete_summaries = sum(
+        checkpoint_summaries.get(f"step_{step}", {}).get("status") == "complete"
+        for step in steps
+    )
+    print(
+        f"Validation matrix finished: tasks={len(tasks)}, ye_rescored={rescored_tasks}, "
+        f"checkpoint_summaries={complete_summaries}, failures={failures}"
+    )
     print(f"MANIFEST_JSON={manifest_path}")
     return 1 if failures else 0
 
